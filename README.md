@@ -163,7 +163,7 @@ python main.py --input video.mp4 --target_lang fr --backend google
 
 ### With optional LipSync
 ```bash
-python main.py --input talk.mp4 --target_lang hi --lipsync
+python main.py --input talk.mp4 --src_lang en --target_lang hi --lipsync
 ```
 
 ### All flags
