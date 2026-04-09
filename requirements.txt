@@ -1,0 +1,65 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# AI Video Dubbing Pipeline — Python Dependencies
+# Install with:  pip install -r requirements.txt
+#
+# System prerequisite (NOT a pip package):
+#   FFmpeg  →  https://ffmpeg.org/download.html
+#              macOS: brew install ffmpeg
+#              Ubuntu: sudo apt install ffmpeg
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Core ─────────────────────────────────────────────────────────────────────
+
+# OpenAI Python SDK (v1+) — used for NVIDIA NIM Whisper API via base_url override
+openai>=1.30.0
+
+# ── Translation backends ──────────────────────────────────────────────────────
+
+# HuggingFace Transformers — IndicTrans2 & MarianMT local inference
+transformers>=4.40.0
+
+# Sentence-piece tokeniser (required by IndicTrans2 and MarianMT)
+sentencepiece>=0.2.0
+
+# Torch — GPU/CPU tensor engine for local model inference
+# CPU-only (smaller download, no GPU needed):
+torch>=2.2.0
+# For CUDA 12.x, replace the line above with:
+#   torch>=2.2.0+cu121 --index-url https://download.pytorch.org/whl/cu121
+
+# Accelerate — speeds up HF model loading and multi-GPU support
+accelerate>=0.29.0
+
+# Google Translate fallback (no API key required for standard use)
+deep-translator>=1.11.4
+
+# ── TTS ───────────────────────────────────────────────────────────────────────
+
+# Local Qwen3-TTS backend
+qwen-tts>=0.1.0
+soundfile>=0.12.1
+demucs>=4.0.1
+
+# ── HTTP client (LipSync API polling + general use) ───────────────────────────
+requests>=2.31.0
+
+# ── Utilities ─────────────────────────────────────────────────────────────────
+
+# Load .env files into os.environ (optional convenience)
+python-dotenv>=1.0.0
+
+# Rich progress bars / logging (optional — nice to have, not imported yet)
+# rich>=13.7.0
+
+# ── ASR ───────────────────────────────────────────────────────────────────────
+faster-whisper>=1.0.3
+
+# ── Quality Metrics (optional but recommended) ────────────────────────────────
+# For production-grade BLEU/chrF calculation (more accurate than built-in)
+# sacrebleu>=2.3.0
+
+# For advanced text similarity metrics
+# sentence-transformers>=2.5.0
+
+# WhisperX ASR (higher timestamp/alignment accuracy)
+whisperx>=3.1.1
