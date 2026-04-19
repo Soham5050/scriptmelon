@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Secrets / local config
+.env
+.env.*
+!.env.example
+
+# Local model weights and downloaded assets
+models/
+Qwen3-TTS-12Hz-1.7B-Base/
+Qwen3-TTS-Tokenizer-12Hz/
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.ckpt
+
+# Generated media and temp output
+output/
+temp/
+tmp/
+*.wav
+*.mp3
+*.mp4
+*.mkv
+*.mov
+
+# Training artifacts
+training_data/
+training_runs/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

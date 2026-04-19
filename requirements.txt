@@ -1,0 +1,67 @@
+# ScriptMelon Python requirements
+#
+# Install from the project root:
+#   python -m pip install -U pip setuptools wheel
+#   python -m pip install -r requirements.txt
+#
+# System dependency:
+#   FFmpeg must be installed and available on PATH.
+#
+# GPU note:
+#   These PyTorch pins target the CUDA 12.8 build used by the RTX 50-series
+#   development setup. For CPU-only or another CUDA version, replace the three
+#   torch package lines with the matching install command from pytorch.org.
+
+--extra-index-url https://download.pytorch.org/whl/cu128
+
+# Core model runtime
+torch==2.8.0+cu128
+torchaudio==2.8.0+cu128
+torchvision==0.23.0+cu128
+transformers==4.57.3
+accelerate==1.12.0
+huggingface-hub>=0.36.2
+safetensors>=0.7.0
+sentencepiece>=0.2.0
+sacremoses>=0.1.1
+protobuf>=3.20.0
+
+# Local Qwen3-TTS package
+-e ./Qwen3-TTS
+
+# Audio, DSP, and source separation
+numpy>=2.0,<3
+scipy>=1.11
+soundfile>=0.12.1
+librosa>=0.11.0
+sox>=1.5.0
+soxr>=1.0.0
+onnxruntime>=1.20.0
+einops>=0.8.0
+demucs>=4.0.1
+
+# ASR
+faster-whisper>=1.2.0
+whisperx>=3.8.1
+
+# Translation and APIs
+deep-translator>=1.11.4
+openai>=1.30.0
+requests>=2.31.0
+
+# Desktop studio GUI
+dearpygui>=2.2
+
+# Config and utilities
+python-dotenv>=1.0.0
+tqdm>=4.67.0
+rich>=13.7.0
+
+# Training / dataset preparation utilities
+datasets>=4.5.0
+scikit-learn>=1.4.0
+pandas>=2.2.0
+
+# Optional quality/research extras:
+# sacrebleu>=2.4.0
+# sentence-transformers>=2.5.0
