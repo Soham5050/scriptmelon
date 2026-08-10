@@ -26,10 +26,7 @@ from merge import merge_audio
 from separation import separate_dialogue_and_bed
 from transcribe import transcribe, transcribe_with_timestamps, unload_asr_resources
 from translate import translate, translate_texts_batch, unload_translation_model
-try:
-    from tts_optimized import synthesize, synthesize_timed_segments, unload_tts_model, _concat_wavs as _tts_concat_wavs
-except ImportError:
-    from tts import synthesize, synthesize_timed_segments, unload_tts_model, _concat_wavs as _tts_concat_wavs
+from tts import synthesize, synthesize_timed_segments, unload_tts_model, _concat_wavs as _tts_concat_wavs
 
 log = config.get_logger("main")
 

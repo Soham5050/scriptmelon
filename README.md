@@ -1,45 +1,60 @@
-# AI Video Dubbing Pipeline
+# ScriptMelon — AI Video Dubbing Pipeline
 
-A modular, production-oriented Python pipeline that takes any video file and
-outputs a dubbed version in a different language using entirely local or
-self-hosted models (except for the NVIDIA NIM Whisper transcription API).
+A modular, adaptive Python pipeline that takes any video file and outputs a
+dubbed version in a different language. Runs entirely locally on consumer
+GPU hardware (RTX 5060 8GB and up), with an optional cloud transcription
+backend if you'd rather not run ASR locally.
 
 ```
 video.mp4
    │
-   ▼  FFmpeg                  audio_utils.py
+   ▼  FFmpeg                        audio_utils.py
 extracted.wav (16kHz mono)
    │
-   ▼  NVIDIA NIM Whisper      transcribe.py
+   ▼  faster-whisper / WhisperX /   transcribe.py
+   │  NVIDIA NIM Whisper (choose one via TRANSCRIBE_BACKEND)
 transcript.txt  ("Hello, welcome to…")
    │
-   ▼  IndicTrans2 / MarianMT  translate.py
+   ▼  Google / IndicTrans2 /        translate.py
+   │  MarianMT / NLLB
 translation.txt ("नमस्ते, स्वागत है…")
    │
-   ▼  Qwen3-TTS (local)       tts.py
+   ▼  Qwen3-TTS (local, w/ voice    tts.py
+   │  cloning support)
 dubbed_audio.wav
    │
-   ▼  FFmpeg                  merge.py
+   ▼  FFmpeg                        merge.py
 output_hi.mp4  ← final dubbed video
    │
-   ▼  [optional] NVIDIA Maxine lipsync.py
+   ▼  [optional --lipsync]          lipsync.py
+   │  NVIDIA Maxine
 output_hi_lipsync.mp4
 ```
+
+A desktop GUI (`studio_gui.py`, built with Dear PyGui) wraps the same CLI so
+you don't have to remember flags.
 
 ---
 
 ## Project Structure
 
 ```
-ai_video_dubber/
-├── main.py            ← CLI entry point + pipeline orchestration
-├── config.py          ← All config via environment variables
-├── audio_utils.py     ← Step 1: FFmpeg audio extraction
-├── transcribe.py      ← Step 2: NVIDIA NIM Whisper ASR
-├── translate.py       ← Step 3: IndicTrans2 / MarianMT / Google Translate
-├── tts.py             ← Step 4: Qwen3-TTS local speech synthesis + voice cloning
-├── merge.py           ← Step 5: FFmpeg audio-video merge
-├── lipsync.py         ← Step 6 (optional): NVIDIA Maxine LipSync
+scriptmelon/
+├── main.py                  ← CLI entry point + pipeline orchestration
+├── studio_gui.py             ← Desktop GUI (Dear PyGui) — wraps main.py
+├── config.py                  ← All config via environment variables (see .env.example)
+├── audio_utils.py             ← Step 1: FFmpeg audio extraction
+├── separation.py               ← Optional: Demucs speech/background separation (--separate_audio)
+├── transcribe.py                ← Step 2: ASR (faster-whisper / WhisperX / NVIDIA NIM)
+├── translate.py                  ← Step 3: Google / IndicTrans2 / MarianMT / NLLB
+├── glossary.py                    ← Domain glossary enforcement for translation
+├── quality_metrics.py             ← ASR/translation/TTS quality scoring
+├── quality_validation.py          ← Quality gate logic used mid-pipeline
+├── tts.py                          ← Step 4: Qwen3-TTS local speech synthesis + voice cloning
+├── merge.py                         ← Step 5: FFmpeg audio-video merge
+├── lipsync.py                        ← Step 6 (optional, --lipsync): NVIDIA Maxine LipSync
+├── scripts/                           ← Qwen3-TTS fine-tuning data prep utilities
+├── Qwen3-TTS/                          ← Local Qwen3-TTS package (installed via -e ./Qwen3-TTS)
 ├── requirements.txt
 ├── .env.example
 └── README.md
@@ -69,32 +84,32 @@ Qwen3-TTS requires Python 3.10 or later.
 python3 --version   # must be 3.10+
 ```
 
-### GPU (strongly recommended for IndicTrans2 and Qwen3-TTS)
-- IndicTrans2 runs on CPU but is ~10× slower than on a GPU.
-- Qwen3-TTS with CPU only is usable for short clips (< 2 min); GPU is preferred.
-- Google Translate backend (`--backend google`) has no GPU requirement.
+### GPU (strongly recommended)
+- `requirements.txt` pins CUDA 12.8 PyTorch wheels by default (RTX 50-series).
+  For a different CUDA version or CPU-only, replace the three `torch*` lines
+  with the matching install command from pytorch.org.
+- The pipeline auto-profiles your GPU at runtime (`ADAPTIVE_RUNTIME_ENABLED`)
+  and adjusts chunk sizes / CPU fallback based on `LOW_VRAM_THRESHOLD_GB` and
+  `MID_VRAM_THRESHOLD_GB` in `.env`.
+- Google Translate backend (`--backend google`) needs no GPU.
+- `--force_cpu` forces CPU-only TTS if you hit CUDA OOM.
 
 ---
 
 ## 2. Environment Setup
 
 ```bash
-# Clone / copy project
-cd ai_video_dubber
+cd scriptmelon
 
-# Create and activate virtual environment
 python3 -m venv venv
 source venv/bin/activate          # Windows: venv\Scripts\activate
 
-# Upgrade pip
 pip install --upgrade pip
-
-# Install dependencies
 pip install -r requirements.txt
-
-# For CUDA 12.x GPU support (replace the torch line in requirements.txt):
-# pip install torch>=2.2.0+cu121 --index-url https://download.pytorch.org/whl/cu121
 ```
+
+`requirements.txt` installs the local `Qwen3-TTS` package in editable mode
+(`-e ./Qwen3-TTS`) — that folder must exist alongside `main.py`.
 
 ---
 
@@ -104,30 +119,32 @@ pip install -r requirements.txt
 cp .env.example .env
 ```
 
-Open `.env` and fill in:
+`.env` is git-ignored — never commit it. Every setting has a working default
+in `config.py`; you only need to touch what you want to change. The ones
+people actually need to look at:
 
 | Variable | Required | Description |
 |---|---|---|
-| `NVIDIA_API_KEY` | **Yes** | NIM API key from https://ngc.nvidia.com |
-| `NVIDIA_WHISPER_MODEL` | No | Default: `nvidia/canary-1b` |
-| `TRANSLATION_BACKEND` | No | `indictrans2` \| `marian` \| `google` |
-| `TTS_REF_AUDIO` | No | Path to reference voice WAV for cloning |
-| `TTS_REF_TEXT` | No | Transcript of reference audio |
-| `NVIDIA_MAXINE_API_KEY` | Only with `--lipsync` | Maxine cloud key |
+| `TRANSCRIBE_BACKEND` | No (default `faster_whisper`) | `faster_whisper` (local) \| `whisperx` (local, alignment+diarization) \| `nvidia` (cloud) |
+| `NVIDIA_API_KEY` | Only if `TRANSCRIBE_BACKEND=nvidia` | NIM API key from https://ngc.nvidia.com |
+| `HF_TOKEN` | Only if `WHISPERX_DIARIZE_ENABLED=true` | HuggingFace token for gated pyannote diarization models |
+| `TRANSLATION_BACKEND` | No (default `indictrans2`) | `indictrans2` \| `marian` \| `nllb` \| `google` |
+| `TTS_REF_AUDIO` / `TTS_REF_TEXT` | No | Default voice-cloning reference (overridable per-run with `--ref_audio`/`--ref_text`) |
+| `NVIDIA_MAXINE_API_KEY` | Only with `--lipsync` | Maxine cloud key (falls back to `NVIDIA_API_KEY` if unset) |
 
 ---
 
 ## 4. First-time Model Downloads
 
-On the first run, two large models are downloaded automatically:
+On first run, models download automatically and get cached in
+`~/.cache/huggingface/` (set `HF_HOME` to change the location):
 
-| Model | Size | Backend | One-time |
-|---|---|---|---|
-| `ai4bharat/indictrans2-en-indic-1B` | ~4 GB | IndicTrans2 | Yes |
-| Qwen3-TTS 1.7B local model | ~4-5 GB | Qwen3-TTS | Yes |
-
-To avoid re-downloading, HuggingFace caches models in `~/.cache/huggingface/`.
-Set `HF_HOME` to change this location.
+| Model | Backend | Trigger |
+|---|---|---|
+| `ai4bharat/indictrans2-en-indic-1B` (~4 GB) | Translation | `TRANSLATION_BACKEND=indictrans2` |
+| Qwen3-TTS 1.7B (~4-5 GB) | TTS | Always (default TTS backend) |
+| faster-whisper `large-v3` | ASR | `TRANSCRIBE_BACKEND=faster_whisper` (default) |
+| Demucs `htdemucs` | Separation | `--separate_audio` / `--preserve_bgm` |
 
 ---
 
@@ -161,25 +178,54 @@ python main.py \
 python main.py --input video.mp4 --target_lang fr --backend google
 ```
 
+### Preserve background music while dubbing over dialogue
+```bash
+python main.py --input video.mp4 --target_lang hi --preserve_bgm --separate_audio
+```
+
+### Resume an interrupted run from checkpoint
+```bash
+python main.py --input video.mp4 --target_lang hi --keep_temp --resume
+```
+
 ### With optional LipSync
 ```bash
 python main.py --input talk.mp4 --target_lang hi --lipsync
 ```
 
+### Or just use the GUI
+```bash
+python studio_gui.py
+```
+
 ### All flags
 ```
-  --input       / -i    Source video file (required)
-  --target_lang / -t    Target language ISO-639-1 code (required)
-  --output      / -o    Output path (default: output/<stem>_<lang>.mp4)
-  --src_lang    / -s    Source language or 'auto' (default: en)
-  --backend     / -b    Translation backend: indictrans2|marian|google
-  --ref_audio           Reference WAV for voice cloning
-  --ref_text            Transcript of reference audio
-  --no_clone            Disable voice cloning
-  --no_pad              Don't pad audio to video length
-  --lipsync             Apply NVIDIA Maxine LipSync (optional)
-  --keep_temp           Keep intermediate files
-  --verbose     / -v    DEBUG logging
+--input        / -i    Source video file (required)
+--target_lang  / -t    Target language code (required)
+--output       / -o    Output path (default: output/<stem>_<lang>.mp4)
+--src_lang     / -s    Source language code, or 'auto' (default: en)
+--backend      / -b    Translation backend: indictrans2 | marian | nllb | google
+--tts_backend           TTS backend: qwen3 (only option currently)
+
+--no_duration_match     Disable time-stretching to ASR timestamps
+--skip_quality_gate     Skip ASR quality gate (not recommended)
+--force_cpu             Force CPU for TTS (slower but memory-safe)
+--interactive           Pause after transcription for manual timeline review/edit
+--resume                Resume from checkpoints in the temp working directory (needs --keep_temp on the original run)
+
+--ref_audio             Reference voice WAV for cloning
+--ref_text              Transcript of the reference audio
+--no_clone              Disable voice cloning
+--no_pad                Do not pad audio to video length
+
+--preserve_bgm          Preserve original music/ambience bed, mix dubbed speech on top
+--separate_audio        Run speech/background separation before ASR (implied in practice by --preserve_bgm)
+--bgm_gain_db           Gain (dB) for the original bed when --preserve_bgm is set (default -8.0)
+--dub_gain_db           Gain (dB) for the dubbed voice when --preserve_bgm is set (default 3.0)
+
+--lipsync               Apply NVIDIA Maxine LipSync
+--keep_temp             Keep intermediate files (temp_dubbing_<name>/)
+--verbose      / -v     DEBUG logging
 ```
 
 ---
@@ -202,7 +248,8 @@ python main.py --input talk.mp4 --target_lang hi --lipsync
 | de   | German    | —           | ✓        | ✓      |
 | ja   | Japanese  | —           | ✓        | ✓      |
 
-For language pairs not supported by IndicTrans2, set `--backend marian` or `--backend google`.
+For pairs `indictrans2` doesn't cover, use `--backend marian`, `--backend nllb`,
+or `--backend google`.
 
 ---
 
@@ -210,17 +257,18 @@ For language pairs not supported by IndicTrans2, set `--backend marian` or `--ba
 
 ```
 output/
-└── lecture_hi.mp4        ← final dubbed video
+└── lecture_hi.mp4          ← final dubbed video
 
 # With --keep_temp:
-temp_dubbing/
-├── extracted_audio.wav   ← 16kHz mono source audio
-├── transcript.txt        ← original speech text
-├── translation.txt       ← translated text
-└── dubbed_audio.wav      ← Qwen3-TTS synthesised voice
-artifacts/
-├── transcript.txt
-└── translation.txt
+temp_dubbing_lecture/
+├── extracted_audio.wav     ← 16kHz mono source audio
+├── transcript.txt          ← original speech text
+├── translation.txt         ← translated text
+├── segments_asr.json       ← ASR segments with timestamps
+├── segments_translated.json ← translated segments with timestamps
+├── review_transcript.txt   ← editable timeline (with --interactive)
+├── checkpoint_*.json       ← per-step checkpoints (for --resume)
+└── dubbed_audio.wav        ← Qwen3-TTS synthesised voice
 ```
 
 ---
@@ -231,10 +279,10 @@ The modular design makes each step replaceable:
 
 | Step | Current | How to swap |
 |---|---|---|
-| Transcription | NVIDIA NIM Whisper | Edit `transcribe.py` — use `openai` Whisper, local `faster-whisper`, or AssemblyAI |
-| Translation | IndicTrans2 | Add a new `BaseTranslator` subclass in `translate.py`; set `TRANSLATION_BACKEND` |
+| Transcription | faster-whisper (default) | Set `TRANSCRIBE_BACKEND=whisperx` or `nvidia` in `.env`, or edit `transcribe.py` |
+| Translation | IndicTrans2 (default) | Set `TRANSLATION_BACKEND` in `.env`, or add a new backend in `translate.py` |
 | TTS | Qwen3-TTS | Edit `tts.py` — swap Qwen3-TTS for another backend if needed |
-| LipSync | NVIDIA Maxine | Edit `lipsync.py` — `apply_lipsync_wav2lip()` is already provided as an alternative |
+| LipSync | NVIDIA Maxine | Edit `lipsync.py` — `apply_lipsync_wav2lip()` is provided as an offline alternative |
 
 ---
 
@@ -243,9 +291,10 @@ The modular design makes each step replaceable:
 | Error | Fix |
 |---|---|
 | `ffmpeg: command not found` | Install FFmpeg and add to PATH |
-| `NVIDIA_API_KEY is not set` | Copy `.env.example → .env` and fill in key |
-| Audio > 25 MB | Split with `ffmpeg -i v.mp4 -segment_time 600 -f segment seg_%03d.mp4` |
-| `No Helsinki-NLP model for pair` | Use `--backend google` for that language pair |
-| Qwen3-TTS `ImportError` | `pip install -U qwen-tts` in your venv |
-| Dubbed audio length mismatch | Use `--no_pad` to trim, or omit to pad silence |
-| IndicTrans2 slow on CPU | Add GPU or use `--backend google` |
+| `NVIDIA_API_KEY is not set for nvidia transcription backend` | Only relevant if `TRANSCRIBE_BACKEND=nvidia`; set the key in `.env` or switch to `faster_whisper` |
+| Audio > 25 MB (NVIDIA backend only) | Split with `ffmpeg -i v.mp4 -segment_time 600 -f segment seg_%03d.mp4` |
+| `No Helsinki-NLP model for pair` | Use `--backend google` or `--backend nllb` for that language pair |
+| Qwen3-TTS `ImportError` | Confirm `Qwen3-TTS/` exists and reinstall with `pip install -e ./Qwen3-TTS` |
+| Dubbed audio length mismatch | Use `--no_pad` to trim, or omit to pad silence; `--no_duration_match` disables time-stretching entirely |
+| CUDA out of memory | Use `--force_cpu`, or lower `QWEN3_LOCAL_MAX_CHARS_PER_CHUNK` / `TTS_MIN_FREE_VRAM_GB` in `.env` |
+| Interrupted a long run | Rerun with `--keep_temp --resume` to pick up from the last checkpoint |

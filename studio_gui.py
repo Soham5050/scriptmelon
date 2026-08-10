@@ -193,6 +193,20 @@ def _validate_paths() -> tuple[Path, Path]:
         raise ValueError("Input and output files must be different.")
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Voice cloning inputs, if set, must point to real files before we launch
+    # the subprocess — main.py will fail deep in the TTS step otherwise.
+    ref_audio_text = state["ref_audio"].strip()
+    if ref_audio_text and not state["no_clone"]:
+        ref_audio_path = Path(ref_audio_text).expanduser()
+        if not ref_audio_path.is_file():
+            raise FileNotFoundError(f"Reference voice WAV not found: {ref_audio_path}")
+        if ref_audio_path.suffix.lower() not in SUPPORTED_AUDIO_EXTENSIONS:
+            raise ValueError(
+                f"Unsupported reference audio format '{ref_audio_path.suffix}'. "
+                f"Supported: {', '.join(sorted(SUPPORTED_AUDIO_EXTENSIONS))}"
+            )
+
     return input_path, output_path
 
 
@@ -261,6 +275,21 @@ def _build_command(preview: bool = False) -> list[str]:
             cmd += ["--dub_gain_db", f"{state['dub_gain_db']:.1f}"]
 
     return cmd
+
+
+def _validate_ref_audio_field():
+    """Live-check the typed ref_audio path and surface a status hint without
+    blocking typing (Start Dubbing still does the hard validation)."""
+    text = state["ref_audio"].strip()
+    if not text:
+        return
+    path = Path(text).expanduser()
+    if not path.exists():
+        _set_status(f"Reference audio not found yet: {path.name}", "warn")
+    elif path.suffix.lower() not in SUPPORTED_AUDIO_EXTENSIONS:
+        _set_status(f"Unsupported reference audio format: {path.suffix}", "warn")
+    else:
+        _set_status("Reference voice looks good.", "idle")
 
 
 def _refresh_command():
@@ -724,6 +753,22 @@ def section_header(label: str, parent=None):
     dpg.add_spacer(height=4, **kwargs)
 
 
+def section_header_row(label: str, button_label: str, button_width: int, button_callback):
+    """Section header with a right-aligned action button, via a proper
+    stretch/fixed table split so it never overlaps regardless of window
+    width (unlike a fixed negative-width spacer)."""
+    with dpg.table(header_row=False, borders_innerH=False, borders_outerH=False,
+                   borders_innerV=False, borders_outerV=False,
+                   policy=dpg.mvTable_SizingStretchProp):
+        dpg.add_table_column(init_width_or_weight=0.75)
+        dpg.add_table_column(init_width_or_weight=0.25)
+        with dpg.table_row():
+            dpg.add_text(label, color=C["muted"])
+            dpg.add_button(label=button_label, width=button_width, callback=button_callback)
+    dpg.add_separator()
+    dpg.add_spacer(height=4)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # UI Build
 # ─────────────────────────────────────────────────────────────────────────────
@@ -843,7 +888,7 @@ def build_ui():
                     with dpg.group(horizontal=True):
                         dpg.add_input_text(tag="ref_audio_field", width=300,
                                            hint="Uses source speech if left empty...",
-                                           callback=lambda s,v: state.update(ref_audio=v) or _refresh_command())
+                                           callback=lambda s,v: (state.update(ref_audio=v), _validate_ref_audio_field(), _refresh_command()))
                         dpg.add_button(label="Browse", width=80,
                                        callback=on_browse_ref_audio)
                     dpg.add_spacer(height=6)
@@ -939,11 +984,7 @@ def build_ui():
 
                 # ── Log Console ───────────────────────────────────────────────
                 with dpg.child_window(height=380, border=True, tag="log_card"):
-                    with dpg.group(horizontal=True):
-                        section_header("RUN CONSOLE")
-                        dpg.add_spacer(width=-90)
-                        dpg.add_button(label="Clear Log", width=85,
-                                       callback=on_clear_log)
+                    section_header_row("RUN CONSOLE", "Clear Log", 85, on_clear_log)
 
                     with dpg.child_window(tag="log_area", border=False,
                                          autosize_x=True, height=310):
@@ -961,11 +1002,7 @@ def build_ui():
 
                 # ── Command Preview ───────────────────────────────────────────
                 with dpg.child_window(height=110, border=True, tag="cmd_card"):
-                    with dpg.group(horizontal=True):
-                        section_header("COMMAND PREVIEW")
-                        dpg.add_spacer(width=-105)
-                        dpg.add_button(label="Copy Command", width=100,
-                                       callback=on_copy_cmd)
+                    section_header_row("COMMAND PREVIEW", "Copy Command", 100, on_copy_cmd)
                     dpg.add_input_text(
                         tag="cmd_text",
                         default_value="python main.py --input video.mp4 ...",
@@ -997,12 +1034,16 @@ def build_ui():
 
         # ── BOTTOM BAR ───────────────────────────────────────────────────────
         with dpg.child_window(height=38, border=True, tag="bottom_bar"):
-            with dpg.group(horizontal=True):
-                dpg.add_text("Ready for a fresh dub.", tag="bottom_status",
-                            color=C["muted"])
-                dpg.add_spacer(width=-200)
-                dpg.add_text("Built by Soham | ScriptMelon",
-                            color=C["muted"])
+            with dpg.table(header_row=False, borders_innerH=False, borders_outerH=False,
+                           borders_innerV=False, borders_outerV=False,
+                           policy=dpg.mvTable_SizingStretchProp):
+                dpg.add_table_column(init_width_or_weight=0.7)
+                dpg.add_table_column(init_width_or_weight=0.3)
+                with dpg.table_row():
+                    dpg.add_text("Ready for a fresh dub.", tag="bottom_status",
+                                color=C["muted"])
+                    dpg.add_text("Built by Soham | ScriptMelon",
+                                color=C["muted"])
 
 
 # ─────────────────────────────────────────────────────────────────────────────
