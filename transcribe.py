@@ -53,6 +53,62 @@ def _validate_audio(audio_path: Path) -> int:
     return audio_path.stat().st_size
 
 
+_CT2_SUPPORTED_CACHE: dict[str, set[str]] = {}
+
+
+def _ct2_supported_compute_types(device: str) -> set[str]:
+    """Compute types CTranslate2 can actually run on *device* here."""
+    if device in _CT2_SUPPORTED_CACHE:
+        return _CT2_SUPPORTED_CACHE[device]
+    supported: set[str] = set()
+    try:
+        import ctranslate2
+
+        supported = set(ctranslate2.get_supported_compute_types(device))
+    except Exception as exc:
+        log.debug("Could not query CTranslate2 compute types for %s: %s", device, exc)
+    _CT2_SUPPORTED_CACHE[device] = supported
+    return supported
+
+
+def _resolve_compute_type(device: str, requested: str) -> str:
+    """
+    Turn a requested compute type into one this CTranslate2 build supports.
+
+    "auto" defers to the runtime profile, which picks int8_float16 on small
+    cards — near-fp16 accuracy at roughly half the weight memory, so a 6 GB
+    GPU can run large-v3 instead of dropping to a smaller, worse model.
+    """
+    requested = (requested or "auto").strip().lower()
+    if requested == "auto":
+        profile = config.get_runtime_profile()
+        requested = str(profile.get("asr_compute_type") or ("float16" if device == "cuda" else "int8"))
+
+    if device == "cpu" and requested not in {"int8", "int8_float32", "float32"}:
+        log.warning("compute_type=%s not suitable for CPU. Falling back to int8.", requested)
+        requested = "int8"
+
+    supported = _ct2_supported_compute_types(device)
+    if supported and requested not in supported:
+        fallbacks = (
+            ["int8", "float32"]
+            if device == "cpu"
+            else ["int8_float16", "float16", "int8_float32", "float32"]
+        )
+        for candidate in fallbacks:
+            if candidate in supported:
+                log.warning(
+                    "compute_type=%s unsupported on %s by this CTranslate2 build; using %s.",
+                    requested,
+                    device,
+                    candidate,
+                )
+                return candidate
+        log.warning("compute_type=%s unsupported on %s and no fallback found.", requested, device)
+
+    return requested
+
+
 def _resolve_device_and_compute_type() -> tuple[str, str]:
     device = config.FASTER_WHISPER_DEVICE
     if device == "auto":
@@ -62,14 +118,18 @@ def _resolve_device_and_compute_type() -> tuple[str, str]:
         except Exception:
             device = "cpu"
 
-    compute_type = config.FASTER_WHISPER_COMPUTE_TYPE
-    if compute_type == "auto":
-        compute_type = "float16" if device == "cuda" else "int8"
-    if device == "cpu" and compute_type in {"float16", "bfloat16"}:
-        log.warning("compute_type=%s not suitable for CPU. Falling back to int8.", compute_type)
-        compute_type = "int8"
+    # Precedence: explicit ASR_COMPUTE_TYPE > explicit FASTER_WHISPER_COMPUTE_TYPE
+    # in .env > tier-aware automatic pick. Never silently override a value the
+    # user chose deliberately.
+    if config.ASR_COMPUTE_TYPE != "auto":
+        requested = config.ASR_COMPUTE_TYPE
+    elif config.FASTER_WHISPER_COMPUTE_TYPE_EXPLICIT:
+        requested = config.FASTER_WHISPER_COMPUTE_TYPE
+    else:
+        requested = "auto"
 
-    return device, compute_type
+    return device, _resolve_compute_type(device, requested)
+
 
 
 def _calculate_repetition_score(text: str) -> float:
@@ -755,9 +815,15 @@ def _transcribe_with_timestamps_whisperx(
     if device == "auto":
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    compute_type = config.WHISPERX_COMPUTE_TYPE
-    if device == "cpu" and compute_type in {"float16", "bfloat16"}:
-        compute_type = "int8"
+    # Same precedence as faster-whisper: explicit user setting beats the
+    # tier-aware pick, and everything is validated against this CTranslate2 build.
+    if config.ASR_COMPUTE_TYPE != "auto":
+        requested_compute = config.ASR_COMPUTE_TYPE
+    elif config.WHISPERX_COMPUTE_TYPE_EXPLICIT:
+        requested_compute = config.WHISPERX_COMPUTE_TYPE
+    else:
+        requested_compute = "auto"
+    compute_type = _resolve_compute_type(device, requested_compute)
 
     log.info(
         "Transcribing '%s' with whisperx model='%s' device='%s' compute_type='%s'...",

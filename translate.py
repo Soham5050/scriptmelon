@@ -37,6 +37,63 @@ MAX_RETRY_ATTEMPTS = 2  # Max retries with different backends
 SEGMENT_BATCH_DELIMITER = "\n###__SEGMENT_BOUNDARY__###\n"
 _TRANSLATOR_SINGLETONS: dict[str, "BaseTranslator"] = {}
 
+
+def _bitsandbytes_available() -> bool:
+    """True when bitsandbytes can actually run here (import + CUDA)."""
+    try:
+        import bitsandbytes  # noqa: F401
+        import torch
+
+        return bool(torch.cuda.is_available())
+    except Exception:
+        return False
+
+
+def _quantization_kwargs(device: str) -> tuple[dict, str]:
+    """
+    Build from_pretrained kwargs for the configured translation quantization.
+
+    Returns (kwargs, mode). An empty dict means plain fp16/fp32 loading. When a
+    quantization config is returned the caller must NOT call `.to(device)` —
+    accelerate already placed the weights, and moving a quantized model raises.
+
+    8-bit costs very little quality on seq2seq MT while freeing roughly 1 GB on
+    the 1B IndicTrans2 checkpoints, which is what lets a 6 GB card run them.
+    """
+    mode = str(config.get_runtime_profile().get("translation_quantization") or "none").lower()
+    if mode in {"none", "", "fp16", "float16"} or device != "cuda":
+        return {}, "none"
+
+    if not _bitsandbytes_available():
+        log.warning(
+            "TRANSLATION_QUANTIZATION=%s requested but bitsandbytes is unavailable; "
+            "loading in fp16 instead. Install it with: pip install bitsandbytes",
+            mode,
+        )
+        return {}, "none"
+
+    try:
+        from transformers import BitsAndBytesConfig
+        import torch
+
+        if mode == "4bit":
+            qconfig = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_compute_dtype=torch.float16,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_use_double_quant=True,
+            )
+        else:
+            mode = "8bit"
+            qconfig = BitsAndBytesConfig(load_in_8bit=True)
+
+        # device_map is required for quantized loads; ".to()" would fail.
+        return {"quantization_config": qconfig, "device_map": {"": 0}}, mode
+    except Exception as exc:
+        log.warning("Could not build quantization config (%s); loading in fp16.", exc)
+        return {}, "none"
+
+
 FLORES_MAP: dict[str, str] = {
     "en": "eng_Latn",
     "hi": "hin_Deva",
@@ -347,10 +404,13 @@ class BaseTranslator(ABC):
 class IndicTrans2Translator(BaseTranslator):
     def __init__(self, device: Optional[str] = None) -> None:
         import torch
-        
+
         self._requested_device = device
         self._device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self._oom_fallback = False
+        # Set when weights are bnb-quantized: such models cannot be moved
+        # between devices, so the CPU OOM fallback must be skipped.
+        self._quantized = False
         log.info("IndicTrans2Translator device=%s", self._device)
 
     @lru_cache(maxsize=MAX_GPU_CACHE)
@@ -359,22 +419,30 @@ class IndicTrans2Translator(BaseTranslator):
         import torch
 
         log.info("Loading IndicTrans2 model: %s", model_id)
-        
+
+        quant_kwargs, quant_mode = _quantization_kwargs(self._device)
+        if quant_mode != "none":
+            log.info("Loading IndicTrans2 in %s (bitsandbytes) to save VRAM.", quant_mode)
+
         try:
             tok = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
             model = AutoModelForSeq2SeqLM.from_pretrained(
-                model_id, 
+                model_id,
                 trust_remote_code=True,
                 torch_dtype=torch.float16 if self._device == "cuda" else torch.float32,
-                low_cpu_mem_usage=True
-            ).to(self._device)
+                low_cpu_mem_usage=True,
+                **quant_kwargs,
+            )
+            if quant_mode == "none":
+                model = model.to(self._device)
+            self._quantized = quant_mode != "none"
             model.eval()
-            
+
             if self._device == "cuda":
                 torch.cuda.empty_cache()
-                
+
             return tok, model
-            
+
         except RuntimeError as e:
             if "out of memory" in str(e).lower():
                 log.error("CUDA OOM loading model. Try: --backend google or restart with empty GPU")
@@ -426,7 +494,13 @@ class IndicTrans2Translator(BaseTranslator):
                     log.warning("CUDA OOM during translation, clearing cache and retrying...")
                     self._cleanup_gpu()
                     gc.collect()
-                    
+
+                    if self._device == "cuda" and self._quantized:
+                        # bnb-quantized weights are pinned to the GPU; moving them
+                        # raises. Retry on GPU after the cache flush instead.
+                        log.warning("Model is quantized and cannot move to CPU; retrying on GPU.")
+                        continue
+
                     if self._device == "cuda":
                         log.warning("Switching to CPU for this chunk...")
                         self._oom_fallback = True
@@ -515,26 +589,36 @@ class MarianMTTranslator(BaseTranslator):
             return self._loaded_models[model_id]
 
         log.info("Loading Marian model: %s", model_id)
-        
+
+        quant_kwargs, quant_mode = _quantization_kwargs(self._device)
+        if quant_mode != "none":
+            log.info("Loading Marian in %s (bitsandbytes) to save VRAM.", quant_mode)
+
         try:
             tok = MarianTokenizer.from_pretrained(model_id)
             model = MarianMTModel.from_pretrained(
                 model_id,
                 torch_dtype=torch.float16 if self._device == "cuda" else torch.float32,
-                low_cpu_mem_usage=True
-            ).to(self._device)
+                low_cpu_mem_usage=True,
+                **quant_kwargs,
+            )
+            if quant_mode == "none":
+                model = model.to(self._device)
             model.eval()
-            
+
             if len(self._loaded_models) >= MAX_GPU_CACHE:
                 oldest = next(iter(self._loaded_models))
                 del self._loaded_models[oldest]
                 self._cleanup_gpu()
-            
+
             self._loaded_models[model_id] = (tok, model)
             return tok, model
-            
+
         except RuntimeError as e:
             if "out of memory" in str(e).lower():
+                if quant_mode != "none":
+                    log.error("CUDA OOM loading quantized Marian model. Try: --backend google or restart with empty GPU")
+                    raise
                 log.error("CUDA OOM loading Marian model. Falling back to CPU...")
                 self._device = "cpu"
                 tok = MarianTokenizer.from_pretrained(model_id)
@@ -769,12 +853,19 @@ class NLLBTranslator(BaseTranslator):
         from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
         import torch
 
+        quant_kwargs, quant_mode = _quantization_kwargs(self._device)
+        if quant_mode != "none":
+            log.info("Loading NLLB in %s (bitsandbytes) to save VRAM.", quant_mode)
+
         tok = AutoTokenizer.from_pretrained(self._model_id)
         model = AutoModelForSeq2SeqLM.from_pretrained(
             self._model_id,
             torch_dtype=torch.float16 if self._device == "cuda" else torch.float32,
             low_cpu_mem_usage=True,
-        ).to(self._device)
+            **quant_kwargs,
+        )
+        if quant_mode == "none":
+            model = model.to(self._device)
         model.eval()
         self._loaded = (tok, model)
         return self._loaded

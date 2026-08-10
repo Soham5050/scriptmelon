@@ -41,7 +41,10 @@ TRANSCRIBE_BACKEND: str = os.environ.get("TRANSCRIBE_BACKEND", "faster_whisper")
 FASTER_WHISPER_MODEL: str = os.environ.get("FASTER_WHISPER_MODEL", "small")
 FASTER_WHISPER_DEVICE: str = os.environ.get("FASTER_WHISPER_DEVICE", "auto")
 
-# INT8 default is safer for low-VRAM cards
+# INT8 default is safer for low-VRAM cards. When this is left unset we treat the
+# compute type as tier-managed (see ASR_COMPUTE_TYPE / get_runtime_profile), so an
+# explicit value in .env always beats the automatic pick.
+FASTER_WHISPER_COMPUTE_TYPE_EXPLICIT: bool = "FASTER_WHISPER_COMPUTE_TYPE" in os.environ
 FASTER_WHISPER_COMPUTE_TYPE: str = os.environ.get("FASTER_WHISPER_COMPUTE_TYPE", "int8")
 FASTER_WHISPER_BEAM_SIZE: int = int(os.environ.get("FASTER_WHISPER_BEAM_SIZE", "5"))
 FASTER_WHISPER_BEST_OF: int = int(os.environ.get("FASTER_WHISPER_BEST_OF", "3"))
@@ -87,6 +90,7 @@ ASR_SKIP_SUSPICIOUS_MAX_RATIO: float = float(
 
 # WhisperX compatibility knobs (used when TRANSCRIBE_BACKEND=whisperx)
 WHISPERX_MODEL: str = os.environ.get("WHISPERX_MODEL", "large-v3")
+WHISPERX_COMPUTE_TYPE_EXPLICIT: bool = "WHISPERX_COMPUTE_TYPE" in os.environ
 WHISPERX_COMPUTE_TYPE: str = os.environ.get("WHISPERX_COMPUTE_TYPE", "float16")
 WHISPERX_BATCH_SIZE: int = int(os.environ.get("WHISPERX_BATCH_SIZE", "4"))
 WHISPERX_DIARIZE_ENABLED: bool = os.environ.get("WHISPERX_DIARIZE_ENABLED", "false").lower() in {
@@ -221,6 +225,15 @@ QWEN3_LOW_VRAM_CLEANUP_EVERY: int = int(os.environ.get("QWEN3_LOW_VRAM_CLEANUP_E
 QWEN3_MID_VRAM_CLEANUP_EVERY: int = int(os.environ.get("QWEN3_MID_VRAM_CLEANUP_EVERY", "2"))
 QWEN3_HIGH_VRAM_CLEANUP_EVERY: int = int(os.environ.get("QWEN3_HIGH_VRAM_CLEANUP_EVERY", "4"))
 
+# Ultra-low tier (<=6 GB): smallest chunks and cleanup after every segment.
+QWEN3_ULTRA_LOW_VRAM_MAX_CHARS_PER_CHUNK: int = int(
+    os.environ.get("QWEN3_ULTRA_LOW_VRAM_MAX_CHARS_PER_CHUNK", "40")
+)
+QWEN3_ULTRA_LOW_VRAM_BATCH_SIZE: int = int(os.environ.get("QWEN3_ULTRA_LOW_VRAM_BATCH_SIZE", "1"))
+QWEN3_ULTRA_LOW_VRAM_CLEANUP_EVERY: int = int(
+    os.environ.get("QWEN3_ULTRA_LOW_VRAM_CLEANUP_EVERY", "1")
+)
+
 # =============================================================================
 # Cloud TTS (Sarvam) - Alternative to local
 # =============================================================================
@@ -244,8 +257,30 @@ ADAPTIVE_RUNTIME_ENABLED: bool = os.environ.get("ADAPTIVE_RUNTIME_ENABLED", "tru
     "1", "true", "yes", "on",
 }
 LOW_VRAM_THRESHOLD_GB: float = float(os.environ.get("LOW_VRAM_THRESHOLD_GB", "7"))
+# New: GPUs at or below this get the ultra_low tier — aggressive compute/weight
+# quantization so 6 GB cards (RTX 2060/3050) can still run high-quality models.
+ULTRA_LOW_VRAM_THRESHOLD_GB: float = float(os.environ.get("ULTRA_LOW_VRAM_THRESHOLD_GB", "6.5"))
 MID_VRAM_THRESHOLD_GB: float = float(os.environ.get("MID_VRAM_THRESHOLD_GB", "14"))
 HIGH_VRAM_THRESHOLD_GB: float = float(os.environ.get("HIGH_VRAM_THRESHOLD_GB", "32"))
+
+# ---------------------------------------------------------------------------
+# Quantization (tier-aware)
+#
+# Each model family has an independent quantization setting. A value of "auto"
+# lets get_runtime_profile() pick the best option for the detected GPU tier;
+# an explicit value ("none"/"8bit"/"4bit") pins it and disables the auto logic.
+# ---------------------------------------------------------------------------
+
+# CTranslate2 compute type for Whisper. "int8_float16" keeps near-fp16 quality
+# at roughly half the VRAM — the single best quality-per-GB lever for low-end cards.
+ASR_COMPUTE_TYPE: str = os.environ.get("ASR_COMPUTE_TYPE", "auto").lower()
+
+# HF seq2seq translation models (IndicTrans2 / Marian / NLLB): none | 8bit | 4bit
+TRANSLATION_QUANTIZATION: str = os.environ.get("TRANSLATION_QUANTIZATION", "auto").lower()
+
+# Qwen3-TTS autoregressive stage: none | 8bit (4-bit is not recommended — it hurts
+# audio-token prosody). Defaults to "auto" (off on >=8 GB, 8-bit only on tiny GPUs).
+TTS_QUANTIZATION: str = os.environ.get("TTS_QUANTIZATION", "auto").lower()
 
 # Force CPU for specific components (for very long videos)
 FORCE_CPU_FOR_TTS: bool = os.environ.get("FORCE_CPU_FOR_TTS", "").lower() in ("true", "1", "yes")
@@ -280,6 +315,8 @@ _RUNTIME_PROFILE_CACHE: dict[str, Any] | None = None
 
 def _recommended_memory_fraction(total_gb: float) -> float:
     """Pick safe per-process memory fraction by GPU tier."""
+    if total_gb <= ULTRA_LOW_VRAM_THRESHOLD_GB:
+        return 0.78
     if total_gb <= LOW_VRAM_THRESHOLD_GB:
         return 0.80
     if total_gb <= MID_VRAM_THRESHOLD_GB:
@@ -289,10 +326,45 @@ def _recommended_memory_fraction(total_gb: float) -> float:
     return 0.92
 
 
+def _resolve_quantization(setting: str, tier: str, *, kind: str) -> str:
+    """
+    Resolve a quantization setting to a concrete mode for the detected tier.
+
+    An explicit value in .env always wins. "auto" picks per tier, biased toward
+    quality: quantize only where it buys meaningful headroom.
+    """
+    setting = (setting or "auto").strip().lower()
+    if setting != "auto":
+        return setting
+
+    if kind == "asr":
+        # CTranslate2 compute types. int8_float16 keeps near-fp16 quality at
+        # ~half the weight memory, so small cards can run large-v3 instead of
+        # dropping to a weaker model — a net quality *win* at 6 GB.
+        if tier in {"ultra_low", "low"}:
+            return "int8_float16"
+        if tier == "cpu":
+            return "int8"
+        return "float16"
+
+    if kind == "translation":
+        # 8-bit costs very little quality on seq2seq MT and frees ~1 GB on the
+        # 1B IndicTrans2 models.
+        return "8bit" if tier == "ultra_low" else "none"
+
+    if kind == "tts":
+        # Qwen3-TTS is autoregressive over audio tokens; 8-bit degrades prosody
+        # and is slower. Only worth it when nothing else fits.
+        return "8bit" if tier == "ultra_low" else "none"
+
+    return "none"
+
+
 def get_runtime_profile(force_refresh: bool = False) -> dict[str, Any]:
     """
     Return adaptive runtime profile based on detected GPU memory.
-    Used by main/tts to tune chunking and CPU fallback.
+    Used by main/tts/transcribe/translate to tune chunking, quantization,
+    and CPU fallback.
     """
     global _RUNTIME_PROFILE_CACHE
     if _RUNTIME_PROFILE_CACHE is not None and not force_refresh:
@@ -313,6 +385,10 @@ def get_runtime_profile(force_refresh: bool = False) -> dict[str, Any]:
         "segment_chunk_seconds_medium": 90.0,
         "segment_chunk_seconds_long": 120.0,
         "segment_chunk_seconds_very_long": 180.0,
+        # Quantization (resolved below once the tier is known).
+        "asr_compute_type": _resolve_quantization(ASR_COMPUTE_TYPE, "cpu", kind="asr"),
+        "translation_quantization": "none",
+        "tts_quantization": "none",
     }
 
     if not ADAPTIVE_RUNTIME_ENABLED:
@@ -326,7 +402,23 @@ def get_runtime_profile(force_refresh: bool = False) -> dict[str, Any]:
             total_gb = float(torch.cuda.get_device_properties(0).total_memory / 1024**3)
             gpu_name = str(torch.cuda.get_device_name(0))
             tier: str
-            if total_gb <= LOW_VRAM_THRESHOLD_GB:
+            if total_gb <= ULTRA_LOW_VRAM_THRESHOLD_GB:
+                tier = "ultra_low"
+                profile.update(
+                    tts_batch_size=max(1, QWEN3_ULTRA_LOW_VRAM_BATCH_SIZE),
+                    tts_max_chars_per_chunk=max(
+                        24,
+                        min(QWEN3_LOCAL_MAX_CHARS_PER_CHUNK, QWEN3_ULTRA_LOW_VRAM_MAX_CHARS_PER_CHUNK),
+                    ),
+                    tts_cleanup_every=max(1, QWEN3_ULTRA_LOW_VRAM_CLEANUP_EVERY),
+                    prefer_cpu_for_long_video=True,
+                    prefer_cpu_for_very_long_video=True,
+                    segment_chunk_seconds_short=30.0,
+                    segment_chunk_seconds_medium=60.0,
+                    segment_chunk_seconds_long=75.0,
+                    segment_chunk_seconds_very_long=90.0,
+                )
+            elif total_gb <= LOW_VRAM_THRESHOLD_GB:
                 tier = "low"
                 profile.update(
                     tts_batch_size=max(1, QWEN3_LOW_VRAM_BATCH_SIZE),
@@ -367,7 +459,11 @@ def get_runtime_profile(force_refresh: bool = False) -> dict[str, Any]:
                 )
 
             fraction = GPU_MEMORY_FRACTION if GPU_MEMORY_FRACTION > 0 else _recommended_memory_fraction(total_gb)
-            tier_fraction_cap = 0.84 if tier == "low" else (0.90 if tier == "mid" else 0.94)
+            tier_fraction_cap = {
+                "ultra_low": 0.82,
+                "low": 0.84,
+                "mid": 0.90,
+            }.get(tier, 0.94)
             fraction = min(float(fraction), tier_fraction_cap)
             profile.update(
                 cuda_available=True,
@@ -375,12 +471,18 @@ def get_runtime_profile(force_refresh: bool = False) -> dict[str, Any]:
                 vram_gb=total_gb,
                 tier=tier,
                 memory_fraction=max(0.5, min(0.95, float(fraction))),
+                asr_compute_type=_resolve_quantization(ASR_COMPUTE_TYPE, tier, kind="asr"),
+                translation_quantization=_resolve_quantization(
+                    TRANSLATION_QUANTIZATION, tier, kind="translation"
+                ),
+                tts_quantization=_resolve_quantization(TTS_QUANTIZATION, tier, kind="tts"),
             )
     except Exception:
         pass
 
     _RUNTIME_PROFILE_CACHE = profile
     return profile
+
 
 def validate() -> None:
     """Validate configuration."""
