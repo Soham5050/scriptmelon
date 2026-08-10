@@ -17,17 +17,28 @@ import sys
 import threading
 from pathlib import Path
 
-import dearpygui.dearpygui as dpg
+try:
+    import dearpygui.dearpygui as dpg
+except ImportError as exc:  # pragma: no cover - startup dependency guard
+    raise SystemExit(
+        "Dear PyGui is not installed. Install it with: python -m pip install dearpygui"
+    ) from exc
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Config
 # ─────────────────────────────────────────────────────────────────────────────
 
 APP_TITLE    = "ScriptMelon Studio"
-WIN_W, WIN_H = 1420, 900
+WIN_W, WIN_H = 1420, 960
 PROJECT_ROOT = Path(__file__).resolve().parent
 MAIN_PY      = PROJECT_ROOT / "main.py"
 OUTPUT_DIR   = PROJECT_ROOT / "output"
+SUPPORTED_VIDEO_EXTENSIONS = {
+    ".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v", ".mpeg", ".mpg",
+}
+SUPPORTED_AUDIO_EXTENSIONS = {
+    ".wav", ".mp3", ".flac", ".m4a", ".ogg", ".aac",
+}
 
 # Colours (RGBA 0-255)
 C = {
@@ -113,6 +124,15 @@ state = {
     "preserve_bgm":      True,
     "separate_audio":    True,
     "force_cpu":         False,
+    "ref_audio":         "",
+    "ref_text":          "",
+    "no_clone":          False,
+    "no_pad":            False,
+    "skip_quality_gate": False,
+    "resume":            False,
+    "lipsync":           False,
+    "bgm_gain_db":       -8.0,
+    "dub_gain_db":       3.0,
     "process":           None,
     "log_queue":         queue.Queue(),
     "runner_thread":     None,
@@ -143,6 +163,37 @@ def _default_output_path() -> str:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     stem = Path(raw_input).stem
     return str(OUTPUT_DIR / f"{stem}_{_target_code()}.mp4")
+
+
+def _validate_paths() -> tuple[Path, Path]:
+    """Validate the selected input/output without touching the pipeline."""
+    if not MAIN_PY.is_file():
+        raise FileNotFoundError(f"main.py was not found: {MAIN_PY}")
+
+    raw_input = state["input_path"].strip()
+    if not raw_input:
+        raise ValueError("No input video selected.")
+
+    input_path = Path(raw_input).expanduser()
+    if not input_path.is_file():
+        raise FileNotFoundError(f"Input video not found: {input_path}")
+
+    if input_path.suffix.lower() not in SUPPORTED_VIDEO_EXTENSIONS:
+        raise ValueError(
+            f"Unsupported video format '{input_path.suffix}'. "
+            f"Supported: {', '.join(sorted(SUPPORTED_VIDEO_EXTENSIONS))}"
+        )
+
+    output_text = state["output_path"].strip() or _default_output_path()
+    if not output_text:
+        raise ValueError("Could not determine an output path.")
+
+    output_path = Path(output_text).expanduser()
+    if input_path.resolve() == output_path.resolve():
+        raise ValueError("Input and output files must be different.")
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    return input_path, output_path
 
 
 def _maybe_autofill_output(force: bool = False) -> None:
@@ -180,13 +231,34 @@ def _build_command(preview: bool = False) -> list[str]:
     if bval:
         cmd += ["--backend", bval]
 
+    # Voice cloning (--ref_audio / --ref_text / --no_clone)
+    ref_audio = state["ref_audio"].strip()
+    if ref_audio:
+        cmd += ["--ref_audio", ref_audio]
+    ref_text = state["ref_text"].strip()
+    if ref_text:
+        cmd += ["--ref_text", ref_text]
+    if state["no_clone"]:          cmd.append("--no_clone")
+
     if state["keep_temp"]:         cmd.append("--keep_temp")
     if state["verbose"]:           cmd.append("--verbose")
     if state["interactive"]:       cmd.append("--interactive")
+    if state["resume"]:            cmd.append("--resume")
     if state["no_duration_match"]: cmd.append("--no_duration_match")
+    if state["no_pad"]:            cmd.append("--no_pad")
+    if state["skip_quality_gate"]: cmd.append("--skip_quality_gate")
     if state["preserve_bgm"]:      cmd.append("--preserve_bgm")
     if state["separate_audio"]:    cmd.append("--separate_audio")
     if state["force_cpu"]:         cmd.append("--force_cpu")
+    if state["lipsync"]:           cmd.append("--lipsync")
+
+    # bgm_gain_db / dub_gain_db only matter with separation active; only pass
+    # them when non-default so the command preview stays clean.
+    if state["preserve_bgm"] or state["separate_audio"]:
+        if abs(state["bgm_gain_db"] - (-8.0)) > 1e-6:
+            cmd += ["--bgm_gain_db", f"{state['bgm_gain_db']:.1f}"]
+        if abs(state["dub_gain_db"] - 3.0) > 1e-6:
+            cmd += ["--dub_gain_db", f"{state['dub_gain_db']:.1f}"]
 
     return cmd
 
@@ -266,21 +338,34 @@ def _append_log(text: str, color: tuple = None):
 
 def _classify_log(line: str) -> tuple[str, tuple]:
     lo = line.lower().strip()
+
     for marker, (pct, label) in PROGRESS_STEPS.items():
         if marker in line:
             _set_progress(pct, label)
             _set_status(line.strip(), "running")
             return line.strip(), C["purple"]
-    if "finished with exit code 0" in lo or "pipeline complete" in lo or "output is ready" in lo:
+
+    if "finished with exit code" in lo:
+        if "exit code 0" in lo:
+            _set_progress(100, "Render complete")
+            _set_status("Output ready - check the output path.", "success")
+            return line.strip(), C["success"]
+        _set_status("Pipeline failed - check the console for details.", "error")
+        return line.strip(), C["error"]
+
+    if "pipeline complete" in lo or "output is ready" in lo:
         _set_progress(100, "Render complete")
-        _set_status("Output ready - check the output folder.", "success")
+        _set_status("Output ready - check the output path.", "success")
         return line.strip(), C["success"]
+
     if "interrupted" in lo or "stop requested" in lo:
         _set_status("Stopping pipeline...", "warn")
         return line.strip(), C["warn"]
-    if "pipeline failed" in lo or "error" in lo:
+
+    if "pipeline failed" in lo or "traceback" in lo or "error" in lo:
         _set_status(line.strip(), "error")
         return line.strip(), C["error"]
+
     if "warning" in lo or "warn" in lo:
         return line.strip(), C["warn"]
     if "info" in lo:
@@ -318,11 +403,19 @@ def on_browse_input():
     def cb(sender, app_data):
         path = app_data.get("file_path_name", "")
         if path:
+            suffix = Path(path).suffix.lower()
+            if suffix not in SUPPORTED_VIDEO_EXTENSIONS:
+                _set_status(f"Unsupported video format: {suffix or 'unknown'}", "error")
+                _append_log(
+                    f"ERROR: Unsupported video format '{suffix or 'unknown'}'.", C["error"]
+                )
+                return
             state["input_path"] = path
             if dpg.does_item_exist("input_field"):
                 dpg.set_value("input_field", path)
             _maybe_autofill_output(force=True)
             _refresh_command()
+            _set_status("Video selected - ready to configure.", "idle")
     dpg.add_file_dialog(
         label="Select Video File",
         callback=cb,
@@ -346,6 +439,36 @@ def on_browse_output():
         modal=True,
         width=700, height=500,
     )
+
+
+def on_browse_ref_audio():
+    def cb(sender, app_data):
+        path = app_data.get("file_path_name", "")
+        if path:
+            suffix = Path(path).suffix.lower()
+            if suffix not in SUPPORTED_AUDIO_EXTENSIONS:
+                _set_status(f"Unsupported reference audio format: {suffix or 'unknown'}", "error")
+                _append_log(
+                    f"ERROR: Unsupported reference audio format '{suffix or 'unknown'}'.", C["error"]
+                )
+                return
+            state["ref_audio"] = path
+            if dpg.does_item_exist("ref_audio_field"):
+                dpg.set_value("ref_audio_field", path)
+            _refresh_command()
+            _set_status("Reference voice selected for cloning.", "idle")
+    dpg.add_file_dialog(
+        label="Select Reference Voice WAV",
+        callback=cb,
+        modal=True,
+        width=700, height=500,
+        file_count=1,
+    )
+
+
+def on_gain_change(sender, val, key):
+    state[key] = float(val)
+    _refresh_command()
 
 
 def on_src_change(sender, val):
@@ -372,13 +495,18 @@ def on_toggle(sender, val, key):
 
 
 def on_start():
-    if state["process"]:
+    if state["process"] is not None:
         return
+
     try:
+        _, output_path = _validate_paths()
+        state["output_path"] = str(output_path)
+        if dpg.does_item_exist("output_field"):
+            dpg.set_value("output_field", str(output_path))
         cmd = _build_command(preview=False)
-    except ValueError as e:
-        _append_log(f"ERROR: {e}", C["error"])
-        _set_status(str(e), "error")
+    except (ValueError, FileNotFoundError, OSError) as exc:
+        _append_log(f"ERROR: {exc}", C["error"])
+        _set_status(str(exc), "error")
         return
 
     _append_log("")
@@ -393,40 +521,65 @@ def on_start():
         dpg.configure_item("stop_btn", enabled=True)
 
     def runner():
+        proc = None
         try:
+            creationflags = 0
+            popen_kwargs = {}
+            if sys.platform == "win32":
+                creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            else:
+                popen_kwargs["start_new_session"] = True
+
             proc = subprocess.Popen(
                 cmd,
                 cwd=str(PROJECT_ROOT),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 bufsize=1,
+                creationflags=creationflags,
+                **popen_kwargs,
             )
             state["process"] = proc
-            assert proc.stdout
+
+            assert proc.stdout is not None
             for line in proc.stdout:
-                state["log_queue"].put(line)
+                state["log_queue"].put(line.rstrip("\r\n"))
+
             rc = proc.wait()
-            state["log_queue"].put(f"\nProcess finished with exit code {rc}.\n")
-            state["log_queue"].put("__DONE__")
-        except Exception as e:
-            state["log_queue"].put(f"\nFailed to start pipeline: {e}\n")
+            state["log_queue"].put(f"Process finished with exit code {rc}.")
+        except Exception as exc:
+            state["log_queue"].put(f"ERROR: Failed to start pipeline: {exc}")
+        finally:
             state["log_queue"].put("__DONE__")
 
-    t = threading.Thread(target=runner, daemon=True)
+    t = threading.Thread(target=runner, name="scriptmelon-runner", daemon=True)
     state["runner_thread"] = t
     t.start()
 
 
 def on_stop():
     proc = state.get("process")
-    if proc:
-        try:
+    if proc is None or proc.poll() is not None:
+        return
+
+    try:
+        if sys.platform == "win32":
+            # CTRL_BREAK is unreliable for GUI-subprocess trees, so terminate
+            # the process we own and let the runner clean up its state.
             proc.terminate()
-            _append_log("Stop requested - pipeline halting.", C["warn"])
-            _set_status("Stopping pipeline...", "warn")
-        except Exception:
-            pass
+        else:
+            try:
+                os.killpg(os.getpgid(proc.pid), 15)
+            except (ProcessLookupError, PermissionError):
+                proc.terminate()
+        _append_log("Stop requested - pipeline halting.", C["warn"])
+        _set_status("Stopping pipeline...", "warn")
+    except OSError as exc:
+        _append_log(f"ERROR: Could not stop pipeline: {exc}", C["error"])
+        _set_status("Could not stop pipeline.", "error")
 
 
 def on_copy_cmd():
@@ -456,9 +609,12 @@ def on_clear_log():
 
 def apply_preset(name: str):
     presets = {
-        "creator": dict(keep_temp=True, verbose=True, interactive=True,  no_duration_match=False, preserve_bgm=True,  separate_audio=True,  force_cpu=False, backend_idx=1),
-        "bgm":     dict(keep_temp=True, verbose=True, interactive=False, no_duration_match=False, preserve_bgm=True,  separate_audio=True,  force_cpu=False, backend_idx=1),
-        "debug":   dict(keep_temp=True, verbose=True, interactive=False, no_duration_match=True,  preserve_bgm=False, separate_audio=False, force_cpu=False, backend_idx=1),
+        "creator": dict(keep_temp=True, verbose=True, interactive=True,  no_duration_match=False, preserve_bgm=True,  separate_audio=True,  force_cpu=False, backend_idx=1,
+                         no_clone=False, no_pad=False, skip_quality_gate=False, resume=False, lipsync=False),
+        "bgm":     dict(keep_temp=True, verbose=True, interactive=False, no_duration_match=False, preserve_bgm=True,  separate_audio=True,  force_cpu=False, backend_idx=1,
+                         no_clone=False, no_pad=False, skip_quality_gate=False, resume=False, lipsync=False),
+        "debug":   dict(keep_temp=True, verbose=True, interactive=False, no_duration_match=True,  preserve_bgm=False, separate_audio=False, force_cpu=False, backend_idx=1,
+                         no_clone=True,  no_pad=False, skip_quality_gate=True,  resume=False, lipsync=False),
     }
     labels = {"creator": "Creator Demo", "bgm": "BGM Heavy", "debug": "Fast Debug"}
     p = presets[name]
@@ -469,6 +625,9 @@ def apply_preset(name: str):
         "keep_temp": "tog_keep", "verbose": "tog_verbose", "interactive": "tog_interactive",
         "no_duration_match": "tog_nodur", "preserve_bgm": "tog_bgm",
         "separate_audio": "tog_sep", "force_cpu": "tog_cpu",
+        "no_clone": "tog_noclone", "no_pad": "tog_nopad",
+        "skip_quality_gate": "tog_skipqg", "resume": "tog_resume",
+        "lipsync": "tog_lipsync",
     }
     for k, tag in toggle_map.items():
         if dpg.does_item_exist(tag):
@@ -677,6 +836,60 @@ def build_ui():
 
                 dpg.add_spacer(height=8)
 
+                # ── Voice Cloning ─────────────────────────────────────────────
+                with dpg.child_window(height=120, border=True, tag="voice_card"):
+                    section_header("VOICE CLONING")
+                    dpg.add_text("Reference voice WAV (optional)", color=C["muted"])
+                    with dpg.group(horizontal=True):
+                        dpg.add_input_text(tag="ref_audio_field", width=300,
+                                           hint="Uses source speech if left empty...",
+                                           callback=lambda s,v: state.update(ref_audio=v) or _refresh_command())
+                        dpg.add_button(label="Browse", width=80,
+                                       callback=on_browse_ref_audio)
+                    dpg.add_spacer(height=6)
+                    dpg.add_input_text(tag="ref_text_field", width=-1,
+                                       hint="Transcript of reference audio (optional)...",
+                                       callback=lambda s,v: state.update(ref_text=v) or _refresh_command())
+                    dpg.add_spacer(height=6)
+                    dpg.add_checkbox(label="Disable voice cloning (--no_clone)", tag="tog_noclone",
+                                    default_value=False,
+                                    callback=lambda s,v: on_toggle(s,v,"no_clone"))
+
+                dpg.add_spacer(height=8)
+
+                # ── Advanced ──────────────────────────────────────────────────
+                with dpg.child_window(height=175, border=True, tag="advanced_card"):
+                    section_header("ADVANCED")
+                    with dpg.group(horizontal=True):
+                        with dpg.group():
+                            dpg.add_checkbox(label="No padding (--no_pad)", tag="tog_nopad",
+                                            default_value=False,
+                                            callback=lambda s,v: on_toggle(s,v,"no_pad"))
+                            dpg.add_checkbox(label="Skip quality gate", tag="tog_skipqg",
+                                            default_value=False,
+                                            callback=lambda s,v: on_toggle(s,v,"skip_quality_gate"))
+                        dpg.add_spacer(width=20)
+                        with dpg.group():
+                            dpg.add_checkbox(label="Resume from checkpoint", tag="tog_resume",
+                                            default_value=False,
+                                            callback=lambda s,v: on_toggle(s,v,"resume"))
+                            dpg.add_checkbox(label="Apply LipSync (Maxine)", tag="tog_lipsync",
+                                            default_value=False,
+                                            callback=lambda s,v: on_toggle(s,v,"lipsync"))
+                    dpg.add_spacer(height=6)
+                    dpg.add_text("BGM / dub mix gain (dB) - used with BGM preserved", color=C["muted"])
+                    with dpg.group(horizontal=True):
+                        dpg.add_slider_float(label="BGM", tag="slider_bgm_gain",
+                                             default_value=-8.0, min_value=-24.0, max_value=6.0,
+                                             width=180, format="%.1f dB",
+                                             callback=lambda s,v: on_gain_change(s,v,"bgm_gain_db"))
+                        dpg.add_slider_float(label="Dub", tag="slider_dub_gain",
+                                             default_value=3.0, min_value=-12.0, max_value=12.0,
+                                             width=180, format="%.1f dB",
+                                             callback=lambda s,v: on_gain_change(s,v,"dub_gain_db"))
+
+                dpg.add_spacer(height=8)
+
                 # ── Presets ───────────────────────────────────────────────────
                 with dpg.child_window(height=80, border=True, tag="preset_card"):
                     section_header("QUICK PRESETS")
@@ -700,11 +913,16 @@ def build_ui():
                 # ── Progress ──────────────────────────────────────────────────
                 with dpg.child_window(height=130, border=True, tag="progress_card"):
                     section_header("PIPELINE PROGRESS")
-                    with dpg.group(horizontal=True):
-                        dpg.add_text("Idle - Ready to dub", tag="step_label",
-                                    color=C["text"])
-                        dpg.add_spacer(width=-60)
-                        dpg.add_text("0%", tag="pct_label", color=C["accent"])
+                    with dpg.table(header_row=False, tag="progress_header_table",
+                                   borders_innerH=False, borders_outerH=False,
+                                   borders_innerV=False, borders_outerV=False,
+                                   policy=dpg.mvTable_SizingStretchProp):
+                        dpg.add_table_column(init_width_or_weight=0.82)
+                        dpg.add_table_column(init_width_or_weight=0.18)
+                        with dpg.table_row():
+                            dpg.add_text("Idle - Ready to dub", tag="step_label",
+                                        color=C["text"])
+                            dpg.add_text("0%", tag="pct_label", color=C["accent"])
 
                     dpg.add_progress_bar(tag="progress_bar", default_value=0.0,
                                         width=-1, height=8)
@@ -732,14 +950,9 @@ def build_ui():
                         dpg.add_text("ScriptMelon Studio - Dear PyGui v2.0",
                                     color=C["accent"])
                         dpg.add_separator()
-                        dpg.add_text("GPU: NVIDIA GeForce RTX 5060 Laptop GPU",
-                                    color=C["muted"])
-                        dpg.add_text("VRAM: 8.0GB | Tier: LOW | bfloat16 mode",
-                                    color=C["muted"])
-                        dpg.add_text("TTS: Qwen3-TTS-12Hz-1.7B-Base",
-                                    color=C["muted"])
-                        dpg.add_text("Translation: Google (batched)",
-                                    color=C["muted"])
+                        dpg.add_text("Runtime: configured by main.py", color=C["muted"])
+                        dpg.add_text("TTS: Qwen3 backend selected by default", color=C["muted"])
+                        dpg.add_text("Translation: selectable backend", color=C["muted"])
                         dpg.add_separator()
                         dpg.add_text("Pipeline ready. Select a video and hit Start.",
                                     color=C["success"])
@@ -747,7 +960,7 @@ def build_ui():
                 dpg.add_spacer(height=8)
 
                 # ── Command Preview ───────────────────────────────────────────
-                with dpg.child_window(height=90, border=True, tag="cmd_card"):
+                with dpg.child_window(height=110, border=True, tag="cmd_card"):
                     with dpg.group(horizontal=True):
                         section_header("COMMAND PREVIEW")
                         dpg.add_spacer(width=-105)
@@ -756,7 +969,7 @@ def build_ui():
                     dpg.add_input_text(
                         tag="cmd_text",
                         default_value="python main.py --input video.mp4 ...",
-                        width=-1, height=42,
+                        width=-1, height=62,
                         multiline=True, readonly=True,
                     )
 
@@ -817,12 +1030,16 @@ def main():
 
     build_ui()
 
+    if not MAIN_PY.is_file():
+        _set_status("main.py not found - pipeline cannot start.", "error")
+        _append_log(f"ERROR: Expected pipeline entry point at {MAIN_PY}", C["error"])
+
     dpg.create_viewport(
         title=APP_TITLE,
         width=WIN_W,
         height=WIN_H,
         min_width=1100,
-        min_height=700,
+        min_height=760,
         small_icon="",
         large_icon="",
     )
