@@ -634,11 +634,110 @@ def _transcribe_faster_whisper(
     return text
 
 
+def _normalize_speaker_label(raw: str, mapping: dict[str, str]) -> str:
+    """
+    Map a pyannote label ("SPEAKER_00") to our stable "spk_NN" form.
+
+    Labels are assigned in first-appearance order so the dominant voice in a
+    clip tends to be spk_00, which is also what single-voice code falls back to.
+    """
+    key = str(raw or "").strip()
+    if not key:
+        return "spk_00"
+    if key not in mapping:
+        mapping[key] = f"spk_{len(mapping):02d}"
+    return mapping[key]
+
+
+def _apply_diarization(
+    audio,
+    segments: list[dict],
+    *,
+    device: str,
+    num_speakers: Optional[int] = None,
+) -> list[dict]:
+    """
+    Attach a `speaker` label to each segment using pyannote via WhisperX.
+
+    Must be called *after* whisperx.align — alignment rebuilds segment dicts and
+    would drop the labels. Returns the segments unchanged (single speaker) if
+    diarization is unavailable, so callers never have to special-case failure.
+    """
+    if not segments:
+        return segments
+
+    if not config.HF_TOKEN:
+        log.warning(
+            "Diarization is enabled but HF_TOKEN is not set. Multi-voice dubbing needs a "
+            "HuggingFace token with access to '%s' — set HF_TOKEN in .env and accept the "
+            "model terms at https://hf.co/%s . Falling back to a single voice.",
+            config.DIARIZATION_MODEL,
+            config.DIARIZATION_MODEL,
+        )
+        return segments
+
+    try:
+        from whisperx.diarize import DiarizationPipeline
+    except Exception as exc:
+        log.warning(
+            "WhisperX DiarizationPipeline is unavailable in this install (%s); using single-speaker fallback.",
+            exc,
+        )
+        return segments
+
+    try:
+        import whisperx
+
+        diarize_model = DiarizationPipeline(
+            model_name=config.DIARIZATION_MODEL,
+            token=config.HF_TOKEN,
+            device=device,
+        )
+
+        kwargs: dict = {}
+        if num_speakers and num_speakers > 0:
+            kwargs["num_speakers"] = int(num_speakers)
+        else:
+            kwargs["max_speakers"] = max(1, int(config.DIARIZATION_MAX_SPEAKERS))
+
+        diarize_df = diarize_model(audio, **kwargs)
+
+        assigned = whisperx.assign_word_speakers(
+            diarize_df,
+            {"segments": segments},
+            fill_nearest=config.DIARIZATION_FILL_NEAREST,
+        )
+        labeled = assigned.get("segments") or segments
+
+        mapping: dict[str, str] = {}
+        for seg in labeled:
+            seg["speaker"] = _normalize_speaker_label(seg.get("speaker", ""), mapping)
+
+        log.info(
+            "Diarization found %d speaker(s) across %d segments.",
+            len(mapping) or 1,
+            len(labeled),
+        )
+        return labeled
+    except Exception as exc:
+        log.warning("Diarization failed (%s); using single-speaker fallback.", exc)
+        return segments
+    finally:
+        # The pyannote pipeline is only needed for this call; free it now so the
+        # TTS stage gets the whole card back on small GPUs.
+        try:
+            del diarize_model
+        except Exception:
+            pass
+        unload_asr_resources()
+
+
 def _transcribe_with_timestamps_whisperx(
     audio_path: Path,
     *,
     language: Optional[str] = None,
     quality_gate: bool = True,
+    num_speakers: Optional[int] = None,
 ) -> dict:
     """
     WhisperX backend with optional alignment.
@@ -702,28 +801,12 @@ def _transcribe_with_timestamps_whisperx(
     segments = result.get("segments") or []
     detected_lang = result.get("language")
 
-    if config.WHISPERX_DIARIZE_ENABLED and segments:
-        if not config.HF_TOKEN:
-            log.warning("WHISPERX_DIARIZE_ENABLED=true but HF_TOKEN is not set; using single-speaker fallback.")
-        else:
-            try:
-                diarization_pipeline_cls = getattr(whisperx, "DiarizationPipeline", None)
-                if diarization_pipeline_cls is None:
-                    log.warning("WhisperX DiarizationPipeline is unavailable in this install; using single-speaker fallback.")
-                else:
-                    diarize_model = diarization_pipeline_cls(
-                        use_auth_token=config.HF_TOKEN,
-                        device=device,
-                    )
-                    diarize_segments = diarize_model(audio)
-                    assigned = whisperx.assign_word_speakers(diarize_segments, result)
-                    segments = assigned.get("segments") or segments
-                    log.info("WhisperX diarization applied to %d segments.", len(segments))
-            except Exception as exc:
-                log.warning("WhisperX diarization failed: %s", exc)
-
     # Optional alignment pass (usually improves timestamp quality).
+    # NOTE: this must run *before* diarization — whisperx.align rebuilds every
+    # segment dict from scratch (start/end/text/words/chars only) and re-groups
+    # by sentence, which would discard any speaker labels assigned earlier.
     if config.WHISPERX_ALIGN_ENABLED and segments:
+        align_model = None
         try:
             align_model, metadata = whisperx.load_align_model(
                 language_code=(language or detected_lang or "en"),
@@ -740,6 +823,22 @@ def _transcribe_with_timestamps_whisperx(
             segments = aligned.get("segments") or segments
         except Exception as exc:
             log.warning("WhisperX alignment skipped: %s", exc)
+        finally:
+            if align_model is not None:
+                del align_model
+            unload_asr_resources()
+
+    if config.WHISPERX_DIARIZE_ENABLED and segments:
+        # Drop the ASR model before pyannote loads — on a 6 GB card the two
+        # together are what pushes us over the edge.
+        del model
+        unload_asr_resources()
+        segments = _apply_diarization(
+            audio,
+            segments,
+            device=device,
+            num_speakers=num_speakers,
+        )
 
     out_segments: list[dict] = []
     for seg in segments:
@@ -856,9 +955,13 @@ def transcribe_with_timestamps(
     *,
     language: Optional[str] = None,
     quality_gate: bool = True,
+    num_speakers: Optional[int] = None,
 ) -> dict:
     """
     Returns segment-level timestamps with quality gating and validation.
+
+    `num_speakers` pins the diarizer to an exact speaker count when the caller
+    knows it; otherwise the count is estimated up to DIARIZATION_MAX_SPEAKERS.
     """
     audio_path = Path(audio_path).resolve()
 
@@ -866,7 +969,16 @@ def transcribe_with_timestamps(
         return _transcribe_with_timestamps_whisperx(
             audio_path,
             language=language,
-            quality_gate=quality_gate, 
+            quality_gate=quality_gate,
+            num_speakers=num_speakers,
+        )
+
+    if num_speakers and num_speakers > 1:
+        log.warning(
+            "num_speakers=%d requested but TRANSCRIBE_BACKEND='%s' cannot diarize. "
+            "Set TRANSCRIBE_BACKEND=whisperx for multi-voice dubbing.",
+            num_speakers,
+            config.TRANSCRIBE_BACKEND,
         )
 
     if config.TRANSCRIBE_BACKEND != "faster_whisper":

@@ -218,13 +218,28 @@ def _resolve_reference_audio(ref_audio_path: str | Path | None) -> Path:
     raise FileNotFoundError("Reference audio not found.")
 
 
-def _prepare_reference_audio(ref_path: Path, out_dir: Path, max_seconds: float = 6.0) -> Path:
-    """Prepare short reference clip for voice cloning."""
+def _prepare_reference_audio(
+    ref_path: Path,
+    out_dir: Path,
+    max_seconds: float = 6.0,
+    *,
+    out_name: str = "ref_clip.wav",
+) -> Path:
+    """
+    Prepare a short reference clip for voice cloning.
+
+    Clips already within *max_seconds* are returned untouched — per-speaker
+    references from speakers.py arrive pre-cut, so they skip this entirely
+    rather than being trimmed a second time.
+
+    *out_name* must be unique per speaker; a shared filename would make every
+    speaker overwrite the previous one's reference.
+    """
     duration = _wav_duration(ref_path)
     if 0 < duration <= max_seconds:
         return ref_path
-    
-    clipped = out_dir / "ref_clip.wav"
+
+    clipped = out_dir / out_name
     cmd = [
         "ffmpeg", "-y", "-i", str(ref_path),
         "-ss", "0", "-t", str(max_seconds),
@@ -364,6 +379,72 @@ def _concat_wavs(parts: List[Path], out_wav: Path, crossfade_ms: int = 50) -> Pa
         cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(list_file), "-c", "copy", str(out_wav)]
         subprocess.run(cmd, check=True, capture_output=True, text=True)
         return out_wav
+
+
+def _has_overlapping_segments(segments: List[dict]) -> bool:
+    """True when any two segments occupy the same instant (crosstalk)."""
+    spans = sorted(
+        (float(s.get("start", 0.0)), float(s.get("end", 0.0)))
+        for s in segments
+        if str(s.get("text", "")).strip()
+    )
+    for i in range(1, len(spans)):
+        if spans[i][0] < spans[i - 1][1] - 0.01:
+            return True
+    return False
+
+
+def _mix_timeline(placed: List[tuple], out_wav: Path) -> Path:
+    """
+    Mix clips onto an absolute timeline, summing anything that overlaps.
+
+    *placed* is a list of (start_seconds, wav_path). Sequential concat cannot
+    represent two people talking at once: it appends the interrupting line
+    after the first, pushing every later line late by the overlap. Placing each
+    clip at its own transcript time keeps the dub aligned with the video.
+    """
+    import numpy as np
+    import wave
+
+    sample_rate = None
+    n_channels = 1
+    sampwidth = 2
+    loaded: List[tuple] = []
+
+    for start, path in placed:
+        with wave.open(str(path), "rb") as wf:
+            if sample_rate is None:
+                sample_rate = wf.getframerate()
+                n_channels = wf.getnchannels()
+                sampwidth = wf.getsampwidth()
+            frames = wf.readframes(wf.getnframes())
+        data = np.frombuffer(frames, dtype=np.int16).astype(np.float32)
+        loaded.append((max(0.0, float(start)), data))
+
+    if not loaded or sample_rate is None:
+        raise RuntimeError("No audio to mix")
+
+    total = max(int(s * sample_rate) + len(d) for s, d in loaded)
+    canvas = np.zeros(total, dtype=np.float32)
+    for start, data in loaded:
+        offset = int(start * sample_rate)
+        canvas[offset : offset + len(data)] += data
+
+    # Sums can exceed int16 range where voices overlap; scale back rather than
+    # clip, so crosstalk stays intelligible instead of turning to distortion.
+    peak = float(np.max(np.abs(canvas))) if canvas.size else 0.0
+    limit = 32767.0
+    if peak > limit:
+        canvas *= limit / peak
+        log.info("Overlapping speech mixed; normalized by %.2fx to avoid clipping.", limit / peak)
+
+    out_wav.parent.mkdir(parents=True, exist_ok=True)
+    with wave.open(str(out_wav), "wb") as wf:
+        wf.setnchannels(n_channels)
+        wf.setsampwidth(sampwidth)
+        wf.setframerate(sample_rate)
+        wf.writeframes(canvas.astype(np.int16).tobytes())
+    return out_wav
 
 
 def _make_silence(dst: Path, duration: float) -> Path:
@@ -905,38 +986,94 @@ def _synthesize_qwen3_timed_segments(
     ref_text: Optional[str],
     no_duration_match: bool = False,
     use_cpu: bool = False,
+    speaker_refs: Optional[dict] = None,
 ) -> Path:
-    """Timed segment synthesis for Qwen3 with memory management."""
+    """
+    Timed segment synthesis for Qwen3 with memory management.
+
+    *speaker_refs* maps speaker_id -> reference wav (from speakers.py). A
+    segment whose speaker has no entry falls back to the global reference, so
+    a bit-part speaker with too little clean audio still gets dubbed.
+    """
     out_dir = Path(out_dir)
     seg_dir = out_dir / "tts_segments"
     seg_dir.mkdir(parents=True, exist_ok=True)
-    
+
     parts: List[Path] = []
+    placed: List[tuple] = []   # (absolute_start_seconds, wav) for the mix path
     cursor = 0.0
-    
-    # Prepare reference once
+
+    # Overlapping segments (two people talking at once) cannot be represented by
+    # sequential concat — it would push every later line late by the overlap.
+    use_timeline_mix = _has_overlapping_segments(segments)
+    if use_timeline_mix:
+        log.info("Overlapping speech detected; placing segments on an absolute timeline.")
+
+    # Global/default reference — used when a segment has no per-speaker clip.
     ref_max_seconds = max(1.0, float(getattr(config, "TTS_SPEAKER_REF_MAX_SECONDS", 6.0)))
-    ref_path = _resolve_reference_audio(ref_audio or config.TTS_REF_AUDIO or None)
-    ref_path = _prepare_reference_audio(ref_path, seg_dir, max_seconds=ref_max_seconds)
+    default_ref = _resolve_reference_audio(ref_audio or config.TTS_REF_AUDIO or None)
+    default_ref = _prepare_reference_audio(default_ref, seg_dir, max_seconds=ref_max_seconds)
     safe_ref_text = _clean_text(ref_text or "")
     language = _qwen3_language_name(target_lang)
-    
+
+    # Prepared references are cached per speaker: the conditioning changes
+    # between segments, but the model is loaded once for the whole run.
+    speaker_refs = speaker_refs or {}
+    prepared_refs: dict[str, Path] = {}
+    if speaker_refs:
+        log.info(
+            "Multi-voice synthesis: %d cloned voice(s) available (%s).",
+            len(speaker_refs),
+            ", ".join(sorted(str(k) for k in speaker_refs)),
+        )
+
+    def _ref_for(speaker_id: str) -> Path:
+        """Resolve (and cache) the reference clip for one speaker."""
+        if speaker_id in prepared_refs:
+            return prepared_refs[speaker_id]
+
+        candidate = speaker_refs.get(speaker_id)
+        resolved = default_ref
+        if candidate:
+            try:
+                candidate = Path(candidate)
+                if candidate.exists():
+                    # speakers.py already cut these to the window, so this is a
+                    # no-op unless the clip is somehow overlong.
+                    resolved = _prepare_reference_audio(
+                        candidate,
+                        seg_dir,
+                        max_seconds=ref_max_seconds,
+                        out_name=f"ref_clip_{speaker_id}.wav",
+                    )
+                else:
+                    log.warning(
+                        "Reference for %s missing at %s; using the default voice.",
+                        speaker_id,
+                        candidate,
+                    )
+            except Exception as exc:
+                log.warning("Could not prepare reference for %s: %s", speaker_id, exc)
+        prepared_refs[speaker_id] = resolved
+        return resolved
+
     # Get model
     model, device = _get_qwen3_model(use_cpu=use_cpu)
     profile = config.get_runtime_profile()
     cleanup_every = max(1, int(profile.get("tts_cleanup_every", 3)))
-    
+
     for i, seg in enumerate(segments):
         text = _clean_text(str(seg.get("text", "")))
         start = float(seg.get("start", 0.0))
         end = float(seg.get("end", start))
         target_dur = max(0.05, end - start)
-        
+        ref_path = _ref_for(str(seg.get("speaker_id") or "spk_00"))
+
         if not text:
             continue
         
-        # Add silence for gaps
-        if start > cursor:
+        # Add silence for gaps (concat path only; the mix path uses absolute times)
+        if not use_timeline_mix and start > cursor:
             gap = start - cursor
             silence = seg_dir / f"{i:04d}_silence.wav"
             _make_silence(silence, gap)
@@ -1061,6 +1198,7 @@ def _synthesize_qwen3_timed_segments(
                         final_wav = candidate_wav
         
         parts.append(final_wav)
+        placed.append((start, final_wav))
         if no_duration_match or not duration_lock_enabled:
             cursor = start + _wav_duration(final_wav)
         else:
@@ -1073,10 +1211,20 @@ def _synthesize_qwen3_timed_segments(
     
     if not parts:
         raise RuntimeError("No TTS segments generated")
-    
+
     out_wav = out_dir / f"{output_stem}.wav"
+    if use_timeline_mix:
+        try:
+            _mix_timeline(placed, out_wav)
+            return out_wav
+        except Exception as exc:
+            log.warning(
+                "Timeline mixing failed (%s); falling back to sequential concat. "
+                "Overlapping lines may drift later.",
+                exc,
+            )
     _concat_wavs(parts, out_wav, crossfade_ms=config.TTS_CROSSFADE_MS)
-    
+
     return out_wav
 
 
@@ -1128,10 +1276,16 @@ def synthesize_timed_segments(
     output_stem: str = "dubbed_audio",
     no_duration_match: bool = False,
     use_cpu: bool = False,
+    speaker_refs: Optional[dict] = None,
 ) -> Path:
-    """Timed segment synthesis."""
+    """
+    Timed segment synthesis.
+
+    *speaker_refs* maps speaker_id -> reference wav for multi-voice dubbing.
+    Omit it (or pass an empty dict) for the single-voice behaviour.
+    """
     backend = (tts_backend or config.TTS_BACKEND).lower()
-    
+
     if backend == "qwen3":
         return _synthesize_qwen3_timed_segments(
             segments,
@@ -1142,8 +1296,9 @@ def synthesize_timed_segments(
             ref_text=ref_text,
             no_duration_match=no_duration_match,
             use_cpu=use_cpu,
+            speaker_refs=speaker_refs,
         )
-    
+
     raise ValueError(f"Backend '{backend}' not supported. Use 'qwen3'.")
 
 

@@ -27,6 +27,7 @@ from separation import separate_dialogue_and_bed
 from transcribe import transcribe, transcribe_with_timestamps, unload_asr_resources
 from translate import translate, translate_texts_batch, unload_translation_model
 from tts import synthesize, synthesize_timed_segments, unload_tts_model, _concat_wavs as _tts_concat_wavs
+from speakers import select_speaker_reference_clips
 
 log = config.get_logger("main")
 
@@ -309,6 +310,7 @@ def _call_synthesize_timed_segments(
     output_stem: Optional[str] = None,
     no_duration_match: bool,
     use_cpu_for_tts: bool,
+    speaker_refs: Optional[dict] = None,
 ) -> Path:
     """Call timed synthesis while remaining compatible with older TTS signatures."""
     def _is_cuda_failure(err: Exception) -> bool:
@@ -331,7 +333,11 @@ def _call_synthesize_timed_segments(
     }
     if output_stem is not None:
         kwargs["output_stem"] = output_stem
-    supports_cpu_retry = "use_cpu" in inspect.signature(synthesize_timed_segments).parameters
+    tts_params = inspect.signature(synthesize_timed_segments).parameters
+    if speaker_refs and "speaker_refs" in tts_params:
+        kwargs["speaker_refs"] = speaker_refs
+    supports_cpu_retry = "use_cpu" in tts_params
+
     if supports_cpu_retry:
         kwargs["use_cpu"] = use_cpu_for_tts
     try:
@@ -489,7 +495,32 @@ def _run_chunked(input_path, output_path, work_dir, args, use_cpu_for_tts: bool,
         original_mix_path: Optional[Path] = None
         speech_stem_path: Optional[Path] = None
         background_bed_path: Optional[Path] = None
-        separation_requested = bool(getattr(args, "separate_audio", False) or getattr(args, "preserve_bgm", False))
+        # Multi-voice needs the isolated vocals stem: cloning a reference from
+        # the raw mix teaches the TTS the room (music, applause), not the person.
+        multi_voice = bool(getattr(args, "multi_voice", False))
+        if multi_voice:
+            # Diarization only exists on the whisperx path, and it is off by
+            # default — opt in explicitly rather than silently dubbing everyone
+            # with one voice.
+            if config.TRANSCRIBE_BACKEND != "whisperx":
+                log.info(
+                    "      --multi_voice requires the whisperx backend; switching from '%s'.",
+                    config.TRANSCRIBE_BACKEND,
+                )
+                config.TRANSCRIBE_BACKEND = "whisperx"
+            config.WHISPERX_DIARIZE_ENABLED = True
+            if not config.HF_TOKEN:
+                log.warning("=" * 64)
+                log.warning("--multi_voice needs a HuggingFace token to detect speakers.")
+                log.warning("  1. Set HF_TOKEN in .env")
+                log.warning("  2. Accept the model terms at https://hf.co/%s", config.DIARIZATION_MODEL)
+                log.warning("Continuing with a single voice for all speakers.")
+                log.warning("=" * 64)
+        separation_requested = bool(
+            getattr(args, "separate_audio", False)
+            or getattr(args, "preserve_bgm", False)
+            or multi_voice
+        )
         separation_used = False
         separation_meta: dict = {
             "requested": separation_requested,
@@ -606,9 +637,10 @@ def _run_chunked(input_path, output_path, work_dir, args, use_cpu_for_tts: bool,
         else:
             try:
                 segments_payload = transcribe_with_timestamps(
-                    wav_path, 
+                    wav_path,
                     language=src_lang_hint,
-                    quality_gate=not args.skip_quality_gate
+                    quality_gate=not args.skip_quality_gate,
+                    num_speakers=(getattr(args, "num_speakers", None) if multi_voice else None),
                 )
                 transcript = (segments_payload.get("text") or "").strip()
             except RuntimeError as e:
@@ -625,6 +657,7 @@ def _run_chunked(input_path, output_path, work_dir, args, use_cpu_for_tts: bool,
                             wav_path,
                             language=src_lang_hint,
                             quality_gate=False,
+                            num_speakers=(getattr(args, "num_speakers", None) if multi_voice else None),
                         )
                         transcript = (segments_payload.get("text") or "").strip()
                         log.warning("Proceeding with relaxed ASR quality gate.")
@@ -795,6 +828,7 @@ def _run_chunked(input_path, output_path, work_dir, args, use_cpu_for_tts: bool,
                             "start": float(seg["start"]),
                             "end": float(seg["end"]),
                             "text": src_text,
+                            "speaker_id": str(seg.get("speaker_id", "spk_00")),
                         }
                     )
             elif segments and not args.no_duration_match:
@@ -827,6 +861,7 @@ def _run_chunked(input_path, output_path, work_dir, args, use_cpu_for_tts: bool,
                         "start": float(seg["start"]),
                         "end": float(seg["end"]),
                         "text": tgt_text.strip(),
+                        "speaker_id": str(seg.get("speaker_id", "spk_00")),
                     })
 
                 if translated_segments:
@@ -920,6 +955,37 @@ def _run_chunked(input_path, output_path, work_dir, args, use_cpu_for_tts: bool,
             ref_audio = auto_ref_audio
         elif not ref_audio or not Path(str(ref_audio)).exists():
             ref_audio = auto_ref_audio
+
+        # Per-speaker reference clips for multi-voice dubbing. Cut from the
+        # isolated vocals stem so a cloned voice carries the person, not the room.
+        speaker_refs: dict = {}
+        if multi_voice and translated_segments and not args.no_clone:
+            distinct = {str(s.get("speaker_id", "spk_00")) for s in translated_segments}
+            if len(distinct) > 1:
+                try:
+                    speaker_refs = select_speaker_reference_clips(
+                        translated_segments,
+                        speech_stem_path or wav_path,
+                        work_dir / "speaker_refs",
+                    )
+                except Exception as exc:
+                    log.warning("      Per-speaker reference extraction failed: %s", exc)
+                    speaker_refs = {}
+                if speaker_refs:
+                    log.info(
+                        "      Multi-voice: %d of %d speaker(s) get a cloned voice.",
+                        len(speaker_refs),
+                        len(distinct),
+                    )
+            else:
+                log.info("      Only one speaker detected; using a single voice.")
+        run_report["multi_voice"] = {
+            "requested": multi_voice,
+            "speakers_detected": len({str(s.get("speaker_id", "spk_00")) for s in translated_segments})
+            if translated_segments
+            else 0,
+            "voices_cloned": len(speaker_refs),
+        }
         
         # Process TTS in chunks for long videos
         if translated_segments and len(translated_segments) > 20:
@@ -966,6 +1032,7 @@ def _run_chunked(input_path, output_path, work_dir, args, use_cpu_for_tts: bool,
                         output_stem=f"chunk_{i:03d}",
                         no_duration_match=args.no_duration_match,
                         use_cpu_for_tts=use_cpu_for_tts,
+                        speaker_refs=speaker_refs,
                     )
                     
                     # Move output to expected location
@@ -997,6 +1064,7 @@ def _run_chunked(input_path, output_path, work_dir, args, use_cpu_for_tts: bool,
                     ref_text=ref_text,
                     no_duration_match=args.no_duration_match,
                     use_cpu_for_tts=use_cpu_for_tts,
+                    speaker_refs=speaker_refs,
                 )
         elif translated_segments:
             # Few segments - process normally
@@ -1009,6 +1077,7 @@ def _run_chunked(input_path, output_path, work_dir, args, use_cpu_for_tts: bool,
                 ref_text=ref_text,
                 no_duration_match=args.no_duration_match,
                 use_cpu_for_tts=use_cpu_for_tts,
+                speaker_refs=speaker_refs,
             )
         else:
             # No segments - synthesize full text
@@ -1174,6 +1243,9 @@ def build_parser():
 
               # Run speech/background separation before ASR for music-heavy videos
               python main.py --input video.mp4 --target_lang en --separate_audio
+
+              # Dub every speaker in the room with their own voice, keeping applause/music
+              python main.py --input video.mp4 --target_lang en --multi_voice --preserve_bgm
         """),
     )
     
@@ -1203,6 +1275,12 @@ def build_parser():
                    help="Preserve original music/ambience bed and mix dubbed speech on top")
     p.add_argument("--separate_audio", action="store_true",
                    help="Run speech/background separation before ASR; implied by --preserve_bgm in practice")
+    p.add_argument("--multi_voice", action="store_true",
+                   help="Detect each speaker and dub them with their own cloned voice. "
+                        "Implies --separate_audio and needs HF_TOKEN (see README)")
+    p.add_argument("--num_speakers", type=int, default=None,
+                   help="Exact number of speakers, when known. Improves diarization accuracy; "
+                        "only used with --multi_voice")
     p.add_argument("--bgm_gain_db", type=float, default=-8.0,
                    help="Gain in dB for original audio bed when --preserve_bgm is enabled")
     p.add_argument("--dub_gain_db", type=float, default=3.0,

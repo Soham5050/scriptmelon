@@ -125,6 +125,81 @@ def get_video_duration(video_path: str | Path) -> float:
     return float(proc.stdout.strip())
 
 
+def slice_audio(
+    input_wav: str | Path,
+    start_sec: float,
+    end_sec: float,
+    out_path: str | Path,
+    *,
+    sample_rate: int | None = None,
+    channels: int | None = None,
+    fade_ms: int = 8,
+) -> Path:
+    """
+    Cut the window [start_sec, end_sec] out of *input_wav* into *out_path*.
+
+    Used to carve a per-speaker voice-cloning reference out of a longer track.
+    A short fade in/out replaces zero-crossing snapping: it kills edge clicks
+    for the same cost, without decoding the waveform in Python.
+
+    Parameters
+    ----------
+    start_sec   : Window start in seconds (clamped at 0).
+    end_sec     : Window end in seconds (must be after start).
+    sample_rate : Optional resample target (e.g. 24 000 for Qwen3-TTS refs).
+    channels    : Optional channel count (1 = mono).
+    fade_ms     : Fade length applied to both edges. 0 disables it.
+    """
+    ffmpeg = _require_ffmpeg()
+    input_wav = Path(input_wav)
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if not input_wav.exists():
+        raise FileNotFoundError(f"Input audio not found: {input_wav}")
+
+    start_sec = max(0.0, float(start_sec))
+    duration = float(end_sec) - start_sec
+    if duration <= 0:
+        raise ValueError(
+            f"slice_audio: end ({end_sec:.3f}s) must be after start ({start_sec:.3f}s)"
+        )
+
+    # -ss before -i seeks fast; -t after sets the copy length.
+    cmd = [
+        ffmpeg,
+        "-y",
+        "-ss", f"{start_sec:.3f}",
+        "-t", f"{duration:.3f}",
+        "-i", str(input_wav),
+    ]
+
+    fade = max(0, int(fade_ms)) / 1000.0
+    # Only fade when the clip is long enough for the fades not to overlap.
+    if fade > 0 and duration > fade * 3:
+        fade_out_start = max(0.0, duration - fade)
+        cmd += [
+            "-af",
+            f"afade=t=in:st=0:d={fade:.3f},afade=t=out:st={fade_out_start:.3f}:d={fade:.3f}",
+        ]
+
+    if sample_rate:
+        cmd += ["-ar", str(sample_rate)]
+    if channels:
+        cmd += ["-ac", str(channels)]
+    cmd += ["-c:a", "pcm_s16le", str(out_path)]
+
+    _run(cmd, step_name="Audio slice")
+
+    if not out_path.exists() or out_path.stat().st_size == 0:
+        raise RuntimeError(f"Audio slice produced no output: {out_path}")
+
+    log.debug(
+        "Sliced %s [%.2fs → %.2fs] → %s", input_wav.name, start_sec, end_sec, out_path.name
+    )
+    return out_path
+
+
 def convert_audio_format(
     src: str | Path,
     dst: str | Path,

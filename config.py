@@ -97,6 +97,23 @@ WHISPERX_ALIGN_ENABLED: bool = os.environ.get("WHISPERX_ALIGN_ENABLED", "true").
 }
 HF_TOKEN: str = os.environ.get("HF_TOKEN", "")
 
+# Speaker diarization (multi-voice dubbing). Requires HF_TOKEN and accepting the
+# gated model terms on HuggingFace.
+DIARIZATION_MODEL: str = os.environ.get(
+    "DIARIZATION_MODEL", "pyannote/speaker-diarization-community-1"
+)
+# Assign the nearest speaker to segments with no diarization overlap instead of
+# leaving them unlabeled. Keeps every segment dubbed with a real voice.
+DIARIZATION_FILL_NEAREST: bool = os.environ.get(
+    "DIARIZATION_FILL_NEAREST", "true"
+).lower() in {"1", "true", "yes", "on"}
+# Upper bound on distinct voices to clone. Extra speakers reuse the dominant voice.
+DIARIZATION_MAX_SPEAKERS: int = int(os.environ.get("DIARIZATION_MAX_SPEAKERS", "8"))
+# Minimum total speech per speaker (seconds) before we trust it enough to clone.
+DIARIZATION_MIN_SPEAKER_SECONDS: float = float(
+    os.environ.get("DIARIZATION_MIN_SPEAKER_SECONDS", "1.5")
+)
+
 # NVIDIA API settings
 NVIDIA_API_KEY: str = os.environ.get("NVIDIA_API_KEY", "")
 NVIDIA_BASE_URL: str = os.environ.get("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1")
