@@ -42,6 +42,12 @@ tmp/
 training_data/
 training_runs/
 
+# Installers and partial browser downloads that land in the repo root
+*.exe
+*.msi
+*.crdownload
+*.part
+
 # IDE / OS
 .vscode/
 .idea/
