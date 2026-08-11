@@ -797,7 +797,108 @@ def _qwen3_generate_single(
         raise
 
 
+# =============================================================================
+# Engine seam
+# =============================================================================
+#
+# Everything on the far side of this boundary is generic: text chunking, the
+# duration lock, timeline mixing, the silent-segment retry, the OOM/CPU fallback
+# ladder. Only four things actually differ between TTS backends, so those four
+# are the entire interface.
+#
+# The alternative -- a synthesis path per backend -- means every fix has to be
+# made twice and will eventually be made once. merge.py's preserve_bgm bug
+# survived as long as it did for exactly that reason.
+
+
+class _TTSEngine:
+    """One TTS backend, reduced to what the synthesis paths need from it."""
+
+    name = "base"
+
+    def language_name(self, target_lang: Optional[str]) -> str:
+        """Backend's own name for a language code, or its auto-detect token."""
+        raise NotImplementedError
+
+    def load(self, use_cpu: bool = False) -> tuple[object, str]:
+        """Return (model, device). Cached by the backend; cheap to call again."""
+        raise NotImplementedError
+
+    def generate(
+        self,
+        model,
+        text: str,
+        language: str,
+        ref_audio: Path,
+        ref_text: str,
+        device: str = "cuda",
+    ) -> Tuple[bytes, int]:
+        """Synthesize one chunk. Returns (wav_bytes, sample_rate)."""
+        raise NotImplementedError
+
+    def unload(self) -> None:
+        """Release the model. Must be a no-op when nothing is loaded."""
+        raise NotImplementedError
+
+
+class _QwenEngine(_TTSEngine):
+    """Qwen3-TTS: 10 languages, none of them Indic. Voice cloning via x-vector."""
+
+    name = "qwen3"
+
+    def language_name(self, target_lang: Optional[str]) -> str:
+        return _qwen3_language_name(target_lang)
+
+    def load(self, use_cpu: bool = False) -> tuple[object, str]:
+        return _get_qwen3_model(use_cpu=use_cpu)
+
+    def generate(
+        self,
+        model,
+        text: str,
+        language: str,
+        ref_audio: Path,
+        ref_text: str,
+        device: str = "cuda",
+    ) -> Tuple[bytes, int]:
+        return _qwen3_generate_single(
+            model=model,
+            text=text,
+            language=language,
+            ref_audio=ref_audio,
+            ref_text=ref_text,
+            device=device,
+        )
+
+    def unload(self) -> None:
+        _unload_qwen3_model()
+
+
+# Constructing an engine must stay side-effect free — unload_tts_model() builds
+# one for every registered backend so that a backend which was never used still
+# reports "nothing loaded" rather than being skipped.
+_ENGINE_FACTORIES: dict[str, type] = {
+    "qwen3": _QwenEngine,
+}
+_ENGINE_CACHE: dict[str, _TTSEngine] = {}
+
+
+def _get_engine(backend: Optional[str]) -> _TTSEngine:
+    """Resolve a backend name to its (cached) engine."""
+    key = (backend or "").strip().lower()
+    factory = _ENGINE_FACTORIES.get(key)
+    if factory is None:
+        supported = ", ".join(sorted(_ENGINE_FACTORIES))
+        raise ValueError(f"Backend '{backend}' not supported. Use one of: {supported}.")
+    engine = _ENGINE_CACHE.get(key)
+    if engine is None:
+        engine = factory()
+        _ENGINE_CACHE[key] = engine
+    return engine
+
+
 def _generate_with_oom_fallback(
+    engine: _TTSEngine,
     model,
     device: str,
     *,
@@ -837,11 +938,11 @@ def _generate_with_oom_fallback(
                 status.allocated_gb,
                 status.free_gb,
             )
-            _unload_qwen3_model()
-            model, device = _get_qwen3_model(use_cpu=True)
+            engine.unload()
+            model, device = engine.load(use_cpu=True)
 
     try:
-        audio_bytes, sample_rate = _qwen3_generate_single(
+        audio_bytes, sample_rate = engine.generate(
             model=model,
             text=text,
             language=language,
@@ -860,7 +961,7 @@ def _generate_with_oom_fallback(
                 log.warning("OOM during generation. Retrying once on GPU after cleanup...")
                 _aggressive_gpu_cleanup(force=True)
                 try:
-                    audio_bytes, sample_rate = _qwen3_generate_single(
+                    audio_bytes, sample_rate = engine.generate(
                         model=model,
                         text=text,
                         language=language,
@@ -876,9 +977,9 @@ def _generate_with_oom_fallback(
             else:
                 log.warning("CUDA execution failure during generation (%s). Switching to CPU fallback.", e)
 
-            _unload_qwen3_model()
-            model, device = _get_qwen3_model(use_cpu=True)
-            audio_bytes, sample_rate = _qwen3_generate_single(
+            engine.unload()
+            model, device = engine.load(use_cpu=True)
+            audio_bytes, sample_rate = engine.generate(
                 model=model,
                 text=text,
                 language=language,
@@ -892,7 +993,8 @@ def _generate_with_oom_fallback(
         raise
 
 
-def _synthesize_qwen3_chunked(
+def _synthesize_chunked(
+    engine: _TTSEngine,
     text: str,
     out_dir: Path,
     *,
@@ -909,16 +1011,16 @@ def _synthesize_qwen3_chunked(
     text = _clean_text(text)
     if not text:
         raise ValueError("Empty text for synthesis")
-    
+
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    
+
     # Prepare reference
     ref_max_seconds = max(1.0, float(getattr(config, "TTS_SPEAKER_REF_MAX_SECONDS", 6.0)))
     ref_path = _resolve_reference_audio(ref_audio or config.TTS_REF_AUDIO or None)
     ref_path = _prepare_reference_audio(ref_path, out_dir, max_seconds=ref_max_seconds)
     safe_ref_text = _clean_text(ref_text or "")
-    language = _qwen3_language_name(target_lang)
+    language = engine.language_name(target_lang)
     
     # Chunk text (adaptive by GPU tier)
     profile = config.get_runtime_profile()
@@ -933,22 +1035,23 @@ def _synthesize_qwen3_chunked(
         raise ValueError("No valid chunks after cleaning")
     
     log.info(f"Synthesizing {len(chunks)} chunks (max {max_chars} chars each)...")
-    
+
     # Get model
-    model, device = _get_qwen3_model(use_cpu=use_cpu)
-    
+    model, device = engine.load(use_cpu=use_cpu)
+
     out_parts: List[Path] = []
     batch_size = int(profile.get("tts_batch_size", 2)) if device == "cuda" else 1
     batch_size = max(1, batch_size)
-    
+
     for batch_start in range(0, len(chunks), batch_size):
         batch_end = min(batch_start + batch_size, len(chunks))
-        
+
         for idx in range(batch_start, batch_end):
             chunk = chunks[idx]
             wav_part = out_dir / f"{output_stem}_{idx:04d}.wav"
 
             audio_bytes, sample_rate, model, device = _generate_with_oom_fallback(
+                engine,
                 model,
                 device,
                 text=chunk,
@@ -976,7 +1079,8 @@ def _synthesize_qwen3_chunked(
     return out_wav
 
 
-def _synthesize_qwen3_timed_segments(
+def _synthesize_timed_segments(
+    engine: _TTSEngine,
     segments: List[dict],
     out_dir: Path,
     *,
@@ -989,7 +1093,7 @@ def _synthesize_qwen3_timed_segments(
     speaker_refs: Optional[dict] = None,
 ) -> Path:
     """
-    Timed segment synthesis for Qwen3 with memory management.
+    Timed segment synthesis with memory management.
 
     *speaker_refs* maps speaker_id -> SpeakerRef (from speakers.py), or to a
     bare reference wav path. A segment whose speaker has no entry falls back to
@@ -1015,7 +1119,7 @@ def _synthesize_qwen3_timed_segments(
     default_ref = _resolve_reference_audio(ref_audio or config.TTS_REF_AUDIO or None)
     default_ref = _prepare_reference_audio(default_ref, seg_dir, max_seconds=ref_max_seconds)
     safe_ref_text = _clean_text(ref_text or "")
-    language = _qwen3_language_name(target_lang)
+    language = engine.language_name(target_lang)
 
     # Prepared references are cached per speaker: the conditioning changes
     # between segments, but the model is loaded once for the whole run.
@@ -1062,7 +1166,7 @@ def _synthesize_qwen3_timed_segments(
         return resolved
 
     # Get model
-    model, device = _get_qwen3_model(use_cpu=use_cpu)
+    model, device = engine.load(use_cpu=use_cpu)
     profile = config.get_runtime_profile()
     cleanup_every = max(1, int(profile.get("tts_cleanup_every", 3)))
 
@@ -1106,6 +1210,7 @@ def _synthesize_qwen3_timed_segments(
             last_dur = 0.0
             for attempt in range(2):
                 audio_bytes, sample_rate, model, device = _generate_with_oom_fallback(
+                    engine,
                     model,
                     device,
                     text=chunk_text,
@@ -1135,8 +1240,8 @@ def _synthesize_qwen3_timed_segments(
                         last_rms,
                     )
                     if device != "cpu":
-                        _unload_qwen3_model()
-                        model, device = _get_qwen3_model(use_cpu=True)
+                        engine.unload()
+                        model, device = engine.load(use_cpu=True)
                 else:
                     log.warning(
                         "Segment %d chunk %d remained low-energy after retry (dur=%.2fs, rms=%.1f). Keeping best effort output.",
@@ -1254,19 +1359,17 @@ def synthesize(
         use_cpu: Force CPU processing (slower but memory-safe for long videos)
     """
     backend = (tts_backend or config.TTS_BACKEND).lower()
-    
-    if backend == "qwen3":
-        return _synthesize_qwen3_chunked(
-            text,
-            out_dir,
-            output_stem=output_stem,
-            target_lang=target_lang,
-            ref_audio=ref_audio,
-            ref_text=ref_text,
-            use_cpu=use_cpu,
-        )
-    
-    raise ValueError(f"Backend '{backend}' not supported in optimized mode. Use 'qwen3'.")
+
+    return _synthesize_chunked(
+        _get_engine(backend),
+        text,
+        out_dir,
+        output_stem=output_stem,
+        target_lang=target_lang,
+        ref_audio=ref_audio,
+        ref_text=ref_text,
+        use_cpu=use_cpu,
+    )
 
 
 def synthesize_timed_segments(
@@ -1285,27 +1388,36 @@ def synthesize_timed_segments(
     """
     Timed segment synthesis.
 
-    *speaker_refs* maps speaker_id -> reference wav for multi-voice dubbing.
-    Omit it (or pass an empty dict) for the single-voice behaviour.
+    *speaker_refs* maps speaker_id -> SpeakerRef (or a bare reference wav) for
+    multi-voice dubbing. Omit it (or pass an empty dict) for single-voice.
     """
     backend = (tts_backend or config.TTS_BACKEND).lower()
 
-    if backend == "qwen3":
-        return _synthesize_qwen3_timed_segments(
-            segments,
-            out_dir,
-            output_stem=output_stem,
-            target_lang=target_lang,
-            ref_audio=ref_audio,
-            ref_text=ref_text,
-            no_duration_match=no_duration_match,
-            use_cpu=use_cpu,
-            speaker_refs=speaker_refs,
-        )
-
-    raise ValueError(f"Backend '{backend}' not supported. Use 'qwen3'.")
+    return _synthesize_timed_segments(
+        _get_engine(backend),
+        segments,
+        out_dir,
+        output_stem=output_stem,
+        target_lang=target_lang,
+        ref_audio=ref_audio,
+        ref_text=ref_text,
+        no_duration_match=no_duration_match,
+        use_cpu=use_cpu,
+        speaker_refs=speaker_refs,
+    )
 
 
 def unload_tts_model():
-    """Public function to unload TTS model and free memory."""
-    _unload_qwen3_model()
+    """
+    Unload every TTS backend and free memory.
+
+    Sequential load/unload is the whole VRAM strategy — peak usage stays at the
+    largest single stage only if the previous stage actually let go. A run that
+    routed to more than one backend must release all of them, so every
+    registered engine is asked, not just the one that ran last.
+    """
+    for name in _ENGINE_FACTORIES:
+        try:
+            _get_engine(name).unload()
+        except Exception as exc:
+            log.warning("Could not unload TTS backend '%s': %s", name, exc)
