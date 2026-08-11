@@ -163,6 +163,42 @@ def test_cli_accepts_exactly_the_supported_backends():
     ) is None
 
 
+def test_env_example_ships_routing_rather_than_a_pinned_backend():
+    # .env.example is the file people copy to .env, so a pin here becomes a pin on
+    # every fresh clone. It really did ship TTS_BACKEND=qwen3, which silently
+    # disabled routing: Indic dubs kept going to a model with no Indian language,
+    # the run still succeeded, and the only symptom was audio nobody could read.
+    # Nothing else in this suite catches it -- config.py's default is "auto" and
+    # every other test either sets the variable or reloads config.
+    from pathlib import Path
+
+    env_example = Path(__file__).resolve().parent.parent / ".env.example"
+    assert env_example.is_file(), ".env.example is the documented config template"
+
+    assignments = [
+        line.split("=", 1)[1].strip().strip("\"'").lower()
+        for line in env_example.read_text(encoding="utf-8").splitlines()
+        if line.strip().startswith("TTS_BACKEND=")
+    ]
+    assert len(assignments) == 1, f"expected one TTS_BACKEND line, got {assignments}"
+    assert assignments[0] == "auto", (
+        f".env.example pins TTS_BACKEND={assignments[0]!r}; a fresh clone would "
+        "never route Indic languages to IndicF5"
+    )
+
+    # Every INDICF5_* key the template documents must actually be read by
+    # config.py -- a template listing a setting that does nothing is worse than
+    # one that omits it, because it looks like a working knob.
+    documented = {
+        line.split("=", 1)[0].strip()
+        for line in env_example.read_text(encoding="utf-8").splitlines()
+        if line.strip().startswith("INDICF5_")
+    }
+    assert documented, ".env.example should document the IndicF5 settings"
+    for key in sorted(documented):
+        assert hasattr(config, key), f".env.example documents dead setting {key}"
+
+
 def test_studio_gui_routing_hint_matches_the_real_router():
     pytest.importorskip("dearpygui.dearpygui", reason="dearpygui not installed")
     import studio_gui
