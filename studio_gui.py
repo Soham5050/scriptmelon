@@ -131,6 +131,8 @@ state = {
     "skip_quality_gate": False,
     "resume":            False,
     "lipsync":           False,
+    "multi_voice":       False,
+    "num_speakers":      0,      # 0 = auto-detect
     "bgm_gain_db":       -8.0,
     "dub_gain_db":       3.0,
     "process":           None,
@@ -196,6 +198,8 @@ def _validate_paths() -> tuple[Path, Path]:
 
     # Voice cloning inputs, if set, must point to real files before we launch
     # the subprocess — main.py will fail deep in the TTS step otherwise.
+    # (Under --multi_voice this still applies: main.py uses --ref_audio as
+    # the fallback voice for any speaker without a clean auto-selected clip.)
     ref_audio_text = state["ref_audio"].strip()
     if ref_audio_text and not state["no_clone"]:
         ref_audio_path = Path(ref_audio_text).expanduser()
@@ -265,6 +269,10 @@ def _build_command(preview: bool = False) -> list[str]:
     if state["separate_audio"]:    cmd.append("--separate_audio")
     if state["force_cpu"]:         cmd.append("--force_cpu")
     if state["lipsync"]:           cmd.append("--lipsync")
+    if state["multi_voice"]:
+        cmd.append("--multi_voice")
+        if int(state["num_speakers"]) > 0:
+            cmd += ["--num_speakers", str(int(state["num_speakers"]))]
 
     # bgm_gain_db / dub_gain_db only matter with separation active; only pass
     # them when non-default so the command preview stays clean.
@@ -520,6 +528,19 @@ def on_backend_change(sender, val):
 
 def on_toggle(sender, val, key):
     state[key] = val
+    _refresh_command()
+
+
+def on_toggle_multi_voice(sender, val):
+    """--multi_voice forces WhisperX + diarization server-side (main.py's
+    job, not ours) — but HF_TOKEN being empty is a guaranteed failure, so we
+    warn here instead of letting the user find out 20 minutes into a run."""
+    state["multi_voice"] = val
+    if val and not os.environ.get("HF_TOKEN", "").strip():
+        _set_status(
+            "Multi-voice needs HF_TOKEN set for speaker diarization (pyannote is gated).",
+            "warn",
+        )
     _refresh_command()
 
 
@@ -903,7 +924,7 @@ def build_ui():
                 dpg.add_spacer(height=8)
 
                 # ── Advanced ──────────────────────────────────────────────────
-                with dpg.child_window(height=175, border=True, tag="advanced_card"):
+                with dpg.child_window(height=225, border=True, tag="advanced_card"):
                     section_header("ADVANCED")
                     with dpg.group(horizontal=True):
                         with dpg.group():
@@ -932,6 +953,16 @@ def build_ui():
                                              default_value=3.0, min_value=-12.0, max_value=12.0,
                                              width=180, format="%.1f dB",
                                              callback=lambda s,v: on_gain_change(s,v,"dub_gain_db"))
+                    dpg.add_spacer(height=6)
+                    dpg.add_checkbox(label="Multi-voice dubbing (--multi_voice)", tag="tog_multivoice",
+                                    default_value=False,
+                                    callback=on_toggle_multi_voice)
+                    with dpg.group(horizontal=True):
+                        dpg.add_text("Speaker count (0 = auto-detect):", color=C["muted"])
+                        dpg.add_input_int(tag="num_speakers_field", width=80,
+                                          default_value=0, min_value=0, max_value=20,
+                                          min_clamped=True, max_clamped=True,
+                                          callback=lambda s,v: state.update(num_speakers=v) or _refresh_command())
 
                 dpg.add_spacer(height=8)
 
