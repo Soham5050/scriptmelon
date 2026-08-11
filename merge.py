@@ -146,22 +146,21 @@ def _merge(
         # - Lower original bed a bit
         # - Duck original when dubbed voice is active
         # - Mix bed + dubbed and limit peaks
-        if background_audio_path is not None:
-            filter_complex = (
-                f"[1:a]volume={original_audio_gain_db:.2f}dB[orig];"
-                f"[2:a]volume={dubbed_audio_gain_db:.2f}dB[dub];"
-                "[orig][dub]sidechaincompress=threshold=0.02:ratio=10:attack=6:release=280[ducked];"
-                "[ducked][dub]amix=inputs=2:duration=first:normalize=0[mix];"
-                "[mix]alimiter=limit=0.95[outa]"
-            )
-        else:
-            filter_complex = (
-                f"[0:a]volume={original_audio_gain_db:.2f}dB[orig];"
-                f"[1:a]volume={dubbed_audio_gain_db:.2f}dB[dub];"
-                "[orig][dub]sidechaincompress=threshold=0.02:ratio=10:attack=6:release=280[ducked];"
-                "[ducked][dub]amix=inputs=2:duration=first:normalize=0[mix];"
-                "[mix]alimiter=limit=0.95[outa]"
-            )
+        #
+        # The dubbed track is needed twice: as the sidechain key that triggers
+        # ducking, and as an input to the final mix. A filter_complex label can
+        # only be consumed once, so it has to be split explicitly. Naming it in
+        # both places instead leaves an unconnected pad, which ffmpeg fills with
+        # the first unused input -- the original audio -- and still exits 0. The
+        # result is a video that reports success and plays the original language.
+        bed_input, dub_input = ("[1:a]", "[2:a]") if background_audio_path is not None else ("[0:a]", "[1:a]")
+        filter_complex = (
+            f"{bed_input}volume={original_audio_gain_db:.2f}dB[bed];"
+            f"{dub_input}volume={dubbed_audio_gain_db:.2f}dB,asplit=2[dubmix][dubkey];"
+            "[bed][dubkey]sidechaincompress=threshold=0.02:ratio=10:attack=6:release=280[ducked];"
+            "[ducked][dubmix]amix=inputs=2:duration=first:normalize=0[mix];"
+            "[mix]alimiter=limit=0.95[outa]"
+        )
         cmd.extend(
             [
                 "-filter_complex",
