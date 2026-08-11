@@ -114,6 +114,7 @@ python3 --version   # must be 3.10+
 ## 2. Environment Setup
 
 ```bash
+git clone --recurse-submodules https://github.com/Soham5050/scriptmelon.git
 cd scriptmelon
 
 python3 -m venv venv
@@ -125,7 +126,13 @@ pip install --no-deps git+https://github.com/ai4bharat/IndicF5.git
 ```
 
 `requirements.txt` installs the local `Qwen3-TTS` package in editable mode
-(`-e ./Qwen3-TTS`) — that folder must exist alongside `main.py`.
+(`-e ./Qwen3-TTS`), so that folder has to be populated before you install. It is
+a git submodule — if you already cloned without `--recurse-submodules`, the
+directory exists but is empty and the install fails on it:
+
+```bash
+git submodule update --init --recursive
+```
 
 IndicF5 is a separate line because it needs `--no-deps`, and pip requirements
 files can't carry that flag. Its own metadata pins `numpy<=1.26.4` and
