@@ -4,8 +4,15 @@ speakers.py
 Pick one voice-cloning reference clip per detected speaker.
 
 Reference clips are cut from the **separated vocals stem**, never the raw mix.
-Cloning from the mix teaches Qwen3-TTS the room — applause, music, ambience —
+Cloning from the mix teaches the TTS model the room — applause, music, ambience —
 instead of the person, and that contamination survives into every dubbed line.
+
+Each clip is returned with the transcript of exactly what is spoken in it.
+Reference-conditioned models of the F5 family need both: the clip supplies the
+voice, the transcript tells the model what that audio *says* so it can infill
+the new line in the same voice. A transcript that does not match the audio is
+worse than none at all, so windows are cut on segment boundaries rather than at
+an arbitrary timestamp — see `_select_reference_window`.
 
 A speaker with too little clean audio simply gets no entry in the returned map;
 the caller falls back to the default/global voice for that speaker alone. A
@@ -16,6 +23,7 @@ from __future__ import annotations
 
 import wave
 from array import array
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
@@ -23,6 +31,23 @@ import config
 from audio_utils import slice_audio
 
 log = config.get_logger(__name__)
+
+
+@dataclass(frozen=True)
+class SpeakerRef:
+    """
+    One speaker's voice-cloning reference.
+
+    `text` is the transcript of `audio` in the **source** language — the clip is
+    original speech, not dubbed output. It is empty when no transcript could be
+    matched to the audio (see `_select_reference_window`); an empty string means
+    "no reliable transcript", and backends that require one should fall back to
+    a known-good prompt rather than pass a mismatched transcript.
+    """
+
+    audio: Path
+    text: str = ""
+
 
 
 # Consecutive turns by the same speaker separated by less than this are treated
@@ -34,7 +59,8 @@ _MAX_JOIN_GAP_SECONDS = 0.75
 # A reference this quiet is silence or breath, not speech.
 _MIN_REFERENCE_RMS = 220.0
 
-# Reference clips for Qwen3-TTS: mono, 24 kHz.
+# Reference clips: mono, 24 kHz — the native rate of both supported TTS
+# backends, so nothing resamples the conditioning audio downstream.
 _REF_SAMPLE_RATE = 24_000
 _REF_CHANNELS = 1
 
@@ -105,7 +131,11 @@ def _build_runs(segments: list[dict]) -> dict[str, list[dict]]:
     reference window containing two voices — exactly the contamination this
     module exists to avoid.
 
-    Returns speaker_id -> list of {start, end, logprob, n} candidate runs.
+    Each run keeps the segments it was built from. The reference transcript is
+    read back off those segments, so discarding them here would make an aligned
+    transcript impossible to recover later.
+
+    Returns speaker_id -> list of {start, end, logprob, n, segments} candidates.
     """
     by_speaker: dict[str, list[dict]] = {}
     ordered = sorted(segments, key=lambda s: float(s.get("start", 0.0)))
@@ -138,6 +168,7 @@ def _build_runs(segments: list[dict]) -> dict[str, list[dict]]:
             run = runs[-1]
             run["end"] = max(run["end"], end)
             run["n"] += 1
+            run["segments"].append(seg)
             if logprob is not None:
                 run["logprob_sum"] += logprob
                 run["logprob_n"] += 1
@@ -149,6 +180,7 @@ def _build_runs(segments: list[dict]) -> dict[str, list[dict]]:
                     "n": 1,
                     "logprob_sum": logprob if logprob is not None else 0.0,
                     "logprob_n": 1 if logprob is not None else 0,
+                    "segments": [seg],
                 }
             )
 
@@ -193,6 +225,80 @@ def _trim_to_window(run: dict, max_seconds: float) -> tuple[float, float]:
     return start + lead, start + lead + max_seconds
 
 
+def _segment_text(seg: dict) -> str:
+    """
+    Source-language text of a segment.
+
+    Callers usually pass *translated* segments, whose `text` holds the dubbed
+    language. The reference clip is original speech, so pairing it with `text`
+    would hand a reference-conditioned model a transcript in the wrong language.
+
+    `source_text` is therefore authoritative when the key is present, **even if
+    empty** — empty means the pipeline knows it cannot supply source text (e.g.
+    timings estimated from a full-text translation, with no ASR segments behind
+    them). Only when the key is absent entirely does `text` apply, which is the
+    case for raw ASR segments passed straight in.
+    """
+    if "source_text" in seg:
+        return (seg.get("source_text") or "").strip()
+    return (seg.get("text") or "").strip()
+
+
+def _select_reference_window(run: dict, max_seconds: float) -> tuple[float, float, str]:
+    """
+    Choose the reference window inside a run, plus its exact transcript.
+
+    Cuts on segment boundaries: the longest contiguous group of whole segments
+    that still fits `max_seconds`, preferring groups near the middle of the run.
+    Whole segments are what make the returned transcript trustworthy — slicing
+    at an arbitrary timestamp would leave a half-spoken word at each edge while
+    the transcript still claimed the whole thing.
+
+    Returns (start, end, text). `text` is empty when no group of whole segments
+    fits the window — a single segment longer than `max_seconds`. The clip is
+    still cut (it remains a fine voice sample) but no transcript can honestly
+    describe it, and callers must not invent one.
+    """
+    segments = [
+        seg
+        for seg in run.get("segments") or []
+        if float(seg.get("end", 0.0)) > float(seg.get("start", 0.0))
+    ]
+    if not segments:
+        start, end = _trim_to_window(run, max_seconds)
+        return start, end, ""
+
+    run_middle = (float(run["start"]) + float(run["end"])) / 2.0
+    best: Optional[tuple[tuple[float, float], int, int]] = None
+
+    for i in range(len(segments)):
+        for j in range(i, len(segments)):
+            start = float(segments[i]["start"])
+            end = float(segments[j]["end"])
+            duration = end - start
+            if duration > max_seconds:
+                break  # extending j only makes the window longer
+            # Longest first, then closest to the middle of the run.
+            key = (duration, -abs((start + end) / 2.0 - run_middle))
+            if best is None or key > best[0]:
+                best = (key, i, j)
+
+    if best is None:
+        start, end = _trim_to_window(run, max_seconds)
+        log.debug(
+            "No whole-segment window fits %.1fs for this run; cutting mid-segment "
+            "and returning no transcript.",
+            max_seconds,
+        )
+        return start, end, ""
+
+    _, i, j = best
+    text = " ".join(
+        t for t in (_segment_text(seg) for seg in segments[i : j + 1]) if t
+    ).strip()
+    return float(segments[i]["start"]), float(segments[j]["end"]), text
+
+
 def select_speaker_reference_clips(
     segments: list[dict],
     vocals_wav_path: str | Path,
@@ -201,7 +307,7 @@ def select_speaker_reference_clips(
     min_seconds: Optional[float] = None,
     max_seconds: Optional[float] = None,
     max_speakers: Optional[int] = None,
-) -> dict[str, Path]:
+) -> dict[str, SpeakerRef]:
     """
     Extract one reference clip per speaker from the separated vocals stem.
 
@@ -220,8 +326,8 @@ def select_speaker_reference_clips(
 
     Returns
     -------
-    speaker_id -> clip path. Speakers without enough clean audio are simply
-    absent; callers treat a missing key as "use the default voice".
+    speaker_id -> SpeakerRef(audio, text). Speakers without enough clean audio
+    are simply absent; callers treat a missing key as "use the default voice".
     """
     vocals_wav_path = Path(vocals_wav_path)
     out_dir = Path(out_dir)
@@ -271,7 +377,7 @@ def select_speaker_reference_clips(
         )
         ranked = ranked[:max_speakers]
 
-    refs: dict[str, Path] = {}
+    refs: dict[str, SpeakerRef] = {}
     for speaker in ranked:
         runs = sorted(
             by_speaker[speaker],
@@ -279,12 +385,12 @@ def select_speaker_reference_clips(
             reverse=True,
         )
 
-        chosen: Optional[Path] = None
+        chosen: Optional[SpeakerRef] = None
         # Walk the ranked candidates so a near-silent best pick can be replaced.
         for attempt, run in enumerate(runs[:3]):
             if _score_run(run, min_seconds, max_seconds, overlap_spans) == float("-inf"):
                 break
-            start, end = _trim_to_window(run, max_seconds)
+            start, end, ref_text = _select_reference_window(run, max_seconds)
             out_path = out_dir / f"ref_{speaker}.wav"
             try:
                 slice_audio(
@@ -308,14 +414,15 @@ def select_speaker_reference_clips(
                 )
                 continue
 
-            chosen = out_path
+            chosen = SpeakerRef(audio=out_path, text=ref_text)
             log.info(
-                "Reference for %s: %.2fs–%.2fs (%.1fs, rms=%.0f) → %s",
+                "Reference for %s: %.2fs–%.2fs (%.1fs, rms=%.0f, %s) → %s",
                 speaker,
                 start,
                 end,
                 end - start,
                 rms,
+                f"{len(ref_text)} chars of transcript" if ref_text else "no transcript",
                 out_path.name,
             )
             break
@@ -332,7 +439,12 @@ def select_speaker_reference_clips(
         refs[speaker] = chosen
 
     if refs:
-        log.info("Built %d per-speaker reference clip(s).", len(refs))
+        with_text = sum(1 for ref in refs.values() if ref.text)
+        log.info(
+            "Built %d per-speaker reference clip(s); %d carry a transcript.",
+            len(refs),
+            with_text,
+        )
     else:
         log.warning("No per-speaker references could be built; falling back to a single voice.")
     return refs

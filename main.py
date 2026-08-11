@@ -195,6 +195,11 @@ def _estimate_timings_from_text(full_text: str, total_duration: float) -> List[d
                 "start": round(start, 3),
                 "end": round(end, 3),
                 "text": sent,
+                # These are sentences of the *translation*, split by word ratio,
+                # with no ASR segment behind them — there is no source text to
+                # pair with the audio at these times. Empty, and explicitly so,
+                # keeps voice-cloning references from quoting the wrong language.
+                "source_text": "",
                 "estimated": True,
             }
         )
@@ -791,6 +796,13 @@ def _run_chunked(input_path, output_path, work_dir, args, use_cpu_for_tts: bool,
             translation = str(translation_ckpt.get("translation") or "").strip()
             ts = translation_ckpt.get("translated_segments")
             translated_segments = ts if isinstance(ts, list) else []
+            # Checkpoints written before source_text existed carry only the
+            # translated `text`. Absent means "fall back to text", which would
+            # hand a voice-cloning reference a transcript in the target
+            # language, so say explicitly that no source text is available.
+            for seg in translated_segments:
+                if isinstance(seg, dict):
+                    seg.setdefault("source_text", "")
             src = str(translation_ckpt.get("source_lang") or src)
             log.info(
                 "      Loaded translation checkpoint (chars=%d, segments=%d)",
@@ -828,6 +840,7 @@ def _run_chunked(input_path, output_path, work_dir, args, use_cpu_for_tts: bool,
                             "start": float(seg["start"]),
                             "end": float(seg["end"]),
                             "text": src_text,
+                            "source_text": src_text,
                             "speaker_id": str(seg.get("speaker_id", "spk_00")),
                         }
                     )
@@ -861,6 +874,10 @@ def _run_chunked(input_path, output_path, work_dir, args, use_cpu_for_tts: bool,
                         "start": float(seg["start"]),
                         "end": float(seg["end"]),
                         "text": tgt_text.strip(),
+                        # Kept for voice-cloning references: the reference clip
+                        # is original speech, so its transcript has to be the
+                        # source text, not the translation.
+                        "source_text": (seg.get("text") or "").strip(),
                         "speaker_id": str(seg.get("speaker_id", "spk_00")),
                     })
 

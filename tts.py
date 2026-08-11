@@ -991,9 +991,10 @@ def _synthesize_qwen3_timed_segments(
     """
     Timed segment synthesis for Qwen3 with memory management.
 
-    *speaker_refs* maps speaker_id -> reference wav (from speakers.py). A
-    segment whose speaker has no entry falls back to the global reference, so
-    a bit-part speaker with too little clean audio still gets dubbed.
+    *speaker_refs* maps speaker_id -> SpeakerRef (from speakers.py), or to a
+    bare reference wav path. A segment whose speaker has no entry falls back to
+    the global reference, so a bit-part speaker with too little clean audio
+    still gets dubbed.
     """
     out_dir = Path(out_dir)
     seg_dir = out_dir / "tts_segments"
@@ -1033,6 +1034,9 @@ def _synthesize_qwen3_timed_segments(
             return prepared_refs[speaker_id]
 
         candidate = speaker_refs.get(speaker_id)
+        # speakers.py returns SpeakerRef(audio, text); a bare path is still
+        # accepted so callers that build references themselves keep working.
+        candidate = getattr(candidate, "audio", candidate)
         resolved = default_ref
         if candidate:
             try:
