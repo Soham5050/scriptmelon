@@ -42,6 +42,13 @@ tmp/
 training_data/
 training_runs/
 
+# Scratch notes and captured run logs. Kept next to the code while debugging a
+# specific clip, but they describe one run on one machine and go stale within
+# the day, so they are not part of the project. Leading underscore is the
+# convention for these.
+_*.log
+_handoff_*.md
+
 # Installers and partial browser downloads that land in the repo root
 *.exe
 *.msi
