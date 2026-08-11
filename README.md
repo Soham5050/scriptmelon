@@ -2,8 +2,8 @@
 
 A modular, adaptive Python pipeline that takes any video file and outputs a
 dubbed version in a different language. Runs entirely locally on consumer
-GPU hardware (RTX 5060 8GB and up), with an optional cloud transcription
-backend if you'd rather not run ASR locally.
+GPU hardware — as low as 6GB VRAM via automatic quantization — with an
+optional cloud transcription backend if you'd rather not run ASR locally.
 
 ```
 video.mp4
@@ -50,11 +50,14 @@ scriptmelon/
 ├── glossary.py                    ← Domain glossary enforcement for translation
 ├── quality_metrics.py             ← ASR/translation/TTS quality scoring
 ├── quality_validation.py          ← Quality gate logic used mid-pipeline
+├── speakers.py                     ← Per-speaker reference-clip selection for --multi_voice
 ├── tts.py                          ← Step 4: Qwen3-TTS local speech synthesis + voice cloning
 ├── merge.py                         ← Step 5: FFmpeg audio-video merge
 ├── lipsync.py                        ← Step 6 (optional, --lipsync): NVIDIA Maxine LipSync
-├── scripts/                           ← Qwen3-TTS fine-tuning data prep utilities
-├── Qwen3-TTS/                          ← Local Qwen3-TTS package (installed via -e ./Qwen3-TTS)
+├── cleanup.py                         ← Housekeeping: delete leftover temp_dubbing_* directories
+├── tests/                              ← Regression tests (pytest)
+├── scripts/                             ← Qwen3-TTS fine-tuning data prep utilities
+├── Qwen3-TTS/                            ← Local Qwen3-TTS package (installed via -e ./Qwen3-TTS)
 ├── requirements.txt
 ├── .env.example
 └── README.md
@@ -89,8 +92,19 @@ python3 --version   # must be 3.10+
   For a different CUDA version or CPU-only, replace the three `torch*` lines
   with the matching install command from pytorch.org.
 - The pipeline auto-profiles your GPU at runtime (`ADAPTIVE_RUNTIME_ENABLED`)
-  and adjusts chunk sizes / CPU fallback based on `LOW_VRAM_THRESHOLD_GB` and
-  `MID_VRAM_THRESHOLD_GB` in `.env`.
+  and picks a VRAM tier — `ultra_low` / `low` / `mid` / `high` — based on
+  `ULTRA_LOW_VRAM_THRESHOLD_GB`, `LOW_VRAM_THRESHOLD_GB`, and
+  `MID_VRAM_THRESHOLD_GB` in `.env`. Each tier adjusts chunk sizes, batch
+  sizes, and CPU fallback automatically.
+- **6GB cards (RTX 2060, 3050, similar) land in the `ultra_low` tier**,
+  which additionally applies quantization automatically: `int8_float16` ASR
+  compute (near-fp16 quality at roughly half the memory, so a 6GB card still
+  runs the full `large-v3` Whisper model instead of a weaker one), and
+  8-bit translation. Qwen3-TTS is intentionally **not** quantized below
+  8-bit — 4-bit measurably degrades prosody, so the tradeoff isn't taken
+  even on the smallest tier. Controlled by `ASR_COMPUTE_TYPE`,
+  `TRANSLATION_QUANTIZATION`, and `TTS_QUANTIZATION` in `.env` — `auto`
+  (the default) picks per-tier automatically; explicit values always win.
 - Google Translate backend (`--backend google`) needs no GPU.
 - `--force_cpu` forces CPU-only TTS if you hit CUDA OOM.
 
@@ -183,6 +197,22 @@ python main.py --input video.mp4 --target_lang fr --backend google
 python main.py --input video.mp4 --target_lang hi --preserve_bgm --separate_audio
 ```
 
+### Multiple speakers, each dubbed in their own cloned voice
+```bash
+python main.py --input meeting.mp4 --target_lang hi --multi_voice
+```
+
+Needs a HuggingFace token — see [Multi-Voice Dubbing](#multi-voice-dubbing)
+below. Without one, `--multi_voice` logs a warning and falls back to
+dubbing everyone with a single voice rather than failing the run.
+
+If you already know how many people are speaking, pass it — it measurably
+improves diarization accuracy over letting it guess:
+
+```bash
+python main.py --input meeting.mp4 --target_lang hi --multi_voice --num_speakers 3
+```
+
 ### Resume an interrupted run from checkpoint
 ```bash
 python main.py --input video.mp4 --target_lang hi --keep_temp --resume
@@ -191,6 +221,22 @@ python main.py --input video.mp4 --target_lang hi --keep_temp --resume
 ### With optional LipSync
 ```bash
 python main.py --input talk.mp4 --target_lang hi --lipsync
+```
+
+### Clean up leftover temp directories after a successful run
+```bash
+python main.py --input video.mp4 --target_lang hi --cleanup_temp
+```
+
+`--keep_temp` runs leave their working directory behind, and those add up
+fast. `--cleanup_temp` sweeps old ones once the run succeeds, keeping any
+directory that still holds resumable checkpoints. To inspect or clean up
+manually:
+
+```bash
+python cleanup.py                 # list what exists, delete nothing
+python cleanup.py --delete        # delete, keeping resumable directories
+python cleanup.py --delete --all  # delete everything, checkpoints included
 ```
 
 ### Or just use the GUI
@@ -223,10 +269,69 @@ python studio_gui.py
 --bgm_gain_db           Gain (dB) for the original bed when --preserve_bgm is set (default -8.0)
 --dub_gain_db           Gain (dB) for the dubbed voice when --preserve_bgm is set (default 3.0)
 
+--multi_voice           Detect each speaker and dub them with their own cloned voice.
+                        Implies --separate_audio; needs HF_TOKEN (see Multi-Voice Dubbing below)
+--num_speakers          Exact speaker count, when known. Only used with --multi_voice;
+                        improves diarization accuracy over auto-detection
+
 --lipsync               Apply NVIDIA Maxine LipSync
 --keep_temp             Keep intermediate files (temp_dubbing_<name>/)
+--cleanup_temp          After a successful run, delete leftover temp_dubbing_* directories
+                        from earlier --keep_temp runs (resumable ones are kept)
 --verbose      / -v     DEBUG logging
 ```
+
+---
+
+## Multi-Voice Dubbing
+
+For source video with more than one speaker — interviews, panels, meetings —
+`--multi_voice` detects each speaker, clones each of their voices separately
+from clean reference clips, and dubs each person in their own voice rather
+than one shared voice for everyone. Overlapping speech (interruptions, cross-
+talk) is mixed at the correct timestamps instead of concatenated sequentially,
+so simultaneous speech doesn't push every later line out of sync.
+
+### Setup (one-time)
+
+Diarization (figuring out *who* is speaking *when*) uses a HuggingFace model
+that's gated behind accepting its terms:
+
+1. Create a token: https://huggingface.co/settings/tokens
+2. Accept the model terms: https://hf.co/pyannote/speaker-diarization-community-1
+3. Set `HF_TOKEN=<your token>` in `.env`
+
+Without a valid `HF_TOKEN`, `--multi_voice` logs a warning and falls back to
+single-voice dubbing — it will not fail the run outright.
+
+### How it works
+
+1. `--multi_voice` implies `--separate_audio` — the source is split into a
+   vocals stem and a background stem before anything else happens.
+2. WhisperX (forced automatically, regardless of `TRANSCRIBE_BACKEND`) runs
+   diarization on the vocals stem, tagging each transcript segment with a
+   speaker ID.
+3. For each speaker, `speakers.py` selects their cleanest reference clip —
+   longest continuous run, filtered for ASR confidence and crosstalk, pulled
+   from the vocals stem so background noise never contaminates the cloned
+   voice. A speaker needs `DIARIZATION_MIN_SPEAKER_SECONDS` (default 1.5s)
+   of clean speech to get a cloned voice; shorter appearances fall back to
+   the default voice rather than failing the run.
+4. Each speaker's lines are synthesized with Qwen3-TTS conditioned on their
+   own reference clip — the model loads once for the whole run, only the
+   per-line voice conditioning changes.
+5. The dubbed lines are placed back on the original timeline and mixed
+   against the separated background stem, so music and ambience from the
+   source are preserved underneath the new dialogue.
+
+### Relevant `.env` settings
+
+| Variable | Default | Description |
+|---|---|---|
+| `DIARIZATION_MODEL` | `pyannote/speaker-diarization-community-1` | HuggingFace diarization model |
+| `DIARIZATION_MAX_SPEAKERS` | `8` | Upper bound on distinct cloned voices; extra speakers reuse the default voice |
+| `DIARIZATION_MIN_SPEAKER_SECONDS` | `1.5` | Minimum clean speech needed before a speaker gets their own cloned voice |
+| `DIARIZATION_FILL_NEAREST` | `true` | Assigns the nearest speaker to segments with no diarization overlap, so every segment gets dubbed rather than silently dropped |
 
 ---
 
@@ -286,7 +391,21 @@ The modular design makes each step replaceable:
 
 ---
 
-## 9. Troubleshooting
+## 9. Tests
+
+```bash
+pip install pytest
+python -m pytest tests/ -v
+```
+
+Tests that shell out to FFmpeg skip themselves automatically when it isn't on
+PATH. `tests/test_merge.py` covers the audio mix with tone signals — the bed
+at 440 Hz and the dub at 660 Hz — so "did the dubbed voice survive the mix"
+is a spectral-energy assertion rather than a listening judgment.
+
+---
+
+## 10. Troubleshooting
 
 | Error | Fix |
 |---|---|
@@ -298,3 +417,7 @@ The modular design makes each step replaceable:
 | Dubbed audio length mismatch | Use `--no_pad` to trim, or omit to pad silence; `--no_duration_match` disables time-stretching entirely |
 | CUDA out of memory | Use `--force_cpu`, or lower `QWEN3_LOCAL_MAX_CHARS_PER_CHUNK` / `TTS_MIN_FREE_VRAM_GB` in `.env` |
 | Interrupted a long run | Rerun with `--keep_temp --resume` to pick up from the last checkpoint |
+| `--multi_voice` dubs everyone in one voice, warning in logs | `HF_TOKEN` is unset or invalid, or the pyannote model terms weren't accepted — see [Multi-Voice Dubbing](#multi-voice-dubbing) setup steps |
+| `--preserve_bgm` / `--separate_audio` fails, Demucs error | Demucs failed to install correctly — check `pip show demucs`; usually a dependency version conflict, reinstalling in a clean venv is the most reliable fix |
+| Translation/ASR quantization not applying on a small GPU | Confirm `ASR_COMPUTE_TYPE` / `TRANSLATION_QUANTIZATION` are `auto` (or explicitly set) in `.env`, and that `bitsandbytes` installed correctly (`pip show bitsandbytes`) |
+| Dubbed video plays the original language | Fixed in the `asplit` merge fix — update to the latest `merge.py`. Older builds silently emitted source audio when `--preserve_bgm` was set |
