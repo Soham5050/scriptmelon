@@ -1184,6 +1184,23 @@ def _run_chunked(input_path, output_path, work_dir, args, use_cpu_for_tts: bool,
         log.info("Output: %s", output_path)
         log.info("Total time: %.1f minutes", total_time / 60)
         log.info(separator)
+
+        # Only after a confirmed success: a failed or interrupted run leaves
+        # checkpoints that --resume needs, and deleting those would turn a
+        # recoverable failure into a full re-run.
+        if getattr(args, "cleanup_temp", False):
+            try:
+                from cleanup import clean_temp_dirs
+
+                clean_temp_dirs(
+                    output_path.parent,
+                    dry_run=False,
+                    keep_resumable=True,
+                    exclude=[work_dir],
+                )
+            except Exception as exc:
+                # The dub succeeded; housekeeping failing must not change that.
+                log.warning("Temp cleanup failed: %s", exc)
         
     except KeyboardInterrupt:
         log.info("Interrupted.")
@@ -1287,6 +1304,10 @@ def build_parser():
                    help="Gain in dB for dubbed voice when --preserve_bgm is enabled")
     p.add_argument("--lipsync", action="store_true", help="Apply lip sync")
     p.add_argument("--keep_temp", action="store_true", help="Keep intermediate files")
+    p.add_argument("--cleanup_temp", action="store_true",
+                   help="After a successful run, delete leftover temp_dubbing_* directories "
+                        "from earlier --keep_temp runs. Directories with resumable checkpoints "
+                        "are kept; use 'python cleanup.py --delete --all' to remove those too")
     p.add_argument("--verbose", "-v", action="store_true", help="DEBUG logging")
     
     return p
