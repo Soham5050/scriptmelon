@@ -97,6 +97,6 @@ datasets>=4.5.0
 scikit-learn>=1.4.0
 pandas>=2.2.0
 
-# Optional quality/research extras:
-# sacrebleu>=2.4.0
-# sentence-transformers>=2.5.0
+# Quality/research extras
+sacrebleu>=2.4.0
+sentence-transformers>=2.5.0
