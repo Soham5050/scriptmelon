@@ -806,7 +806,430 @@ def _qwen3_generate_single(
         raise
 
 
+# =============================================================================
+# Engine seam
+# =============================================================================
+#
+# Everything on the far side of this boundary is generic: text chunking, the
+# duration lock, timeline mixing, the silent-segment retry, the OOM/CPU fallback
+# ladder. Only four things actually differ between TTS backends, so those four
+# are the entire interface.
+#
+# The alternative -- a synthesis path per backend -- means every fix has to be
+# made twice and will eventually be made once. merge.py's preserve_bgm bug
+# survived as long as it did for exactly that reason.
+
+
+class _TTSEngine:
+    """One TTS backend, reduced to what the synthesis paths need from it."""
+
+    name = "base"
+
+    def language_name(self, target_lang: Optional[str]) -> str:
+        """Backend's own name for a language code, or its auto-detect token."""
+        raise NotImplementedError
+
+    def load(self, use_cpu: bool = False) -> tuple[object, str]:
+        """Return (model, device). Cached by the backend; cheap to call again."""
+        raise NotImplementedError
+
+    def generate(
+        self,
+        model,
+        text: str,
+        language: str,
+        ref_audio: Path,
+        ref_text: str,
+        device: str = "cuda",
+    ) -> Tuple[bytes, int]:
+        """Synthesize one chunk. Returns (wav_bytes, sample_rate)."""
+        raise NotImplementedError
+
+    def unload(self) -> None:
+        """Release the model. Must be a no-op when nothing is loaded."""
+        raise NotImplementedError
+
+
+class _QwenEngine(_TTSEngine):
+    """Qwen3-TTS: 10 languages, none of them Indic. Voice cloning via x-vector."""
+
+    name = "qwen3"
+
+    def language_name(self, target_lang: Optional[str]) -> str:
+        return _qwen3_language_name(target_lang)
+
+    def load(self, use_cpu: bool = False) -> tuple[object, str]:
+        return _get_qwen3_model(use_cpu=use_cpu)
+
+    def generate(
+        self,
+        model,
+        text: str,
+        language: str,
+        ref_audio: Path,
+        ref_text: str,
+        device: str = "cuda",
+    ) -> Tuple[bytes, int]:
+        return _qwen3_generate_single(
+            model=model,
+            text=text,
+            language=language,
+            ref_audio=ref_audio,
+            ref_text=ref_text,
+            device=device,
+        )
+
+    def unload(self) -> None:
+        _unload_qwen3_model()
+
+
+# =============================================================================
+# IndicF5
+# =============================================================================
+#
+# The 11 Indian languages Qwen3-TTS does not have. IndicF5 takes no language
+# argument at all -- the script it is handed tells it which language it is
+# reading -- so there is no language map on this side, only a passthrough.
+
+_INDICF5_MODEL = None
+_INDICF5_DEVICE: Optional[str] = None
+
+# Languages IndicF5 was trained on: Assamese, Bengali, Gujarati, Hindi, Kannada,
+# Malayalam, Marathi, Odia, Punjabi, Tamil, Telugu.
+_INDICF5_LANGS = frozenset({"as", "bn", "gu", "hi", "kn", "ml", "mr", "or", "pa", "ta", "te"})
+
+# The one reference clip whose transcript is published (in the project README),
+# so the only bundled pair that can be used honestly. It is Punjabi; the README's
+# own example conditions on it to generate Hindi, so cross-language conditioning
+# within Indic is the authors' demonstrated usage.
+_INDICF5_PROMPT_FILE = "prompts/PAN_F_HAPPY_00001.wav"
+_INDICF5_PROMPT_TEXT = (
+    "ਭਹੰਪੀ ਵਿੱਚ ਸਮਾਰਕਾਂ ਦੇ ਭਵਨ ਨਿਰਮਾਣ ਕਲਾ ਦੇ ਵੇਰਵੇ ਗੁੰਝਲਦਾਰ ਅਤੇ ਹੈਰਾਨ ਕਰਨ ਵਾਲੇ ਹਨ, "
+    "ਜੋ ਮੈਨੂੰ ਖੁਸ਼ ਕਰਦੇ  ਹਨ।"
+)
+# The prompts are known to live in the GitHub repo; whether the gated HF model
+# repo mirrors them could not be checked without a token. So try HF first (same
+# pinned revision as the weights) and fall back to GitHub raw at a pinned commit.
+# Both are pinned: an unpinned prompt would silently change the fallback voice.
+_INDICF5_PROMPT_GITHUB_REPO = "AI4Bharat/IndicF5"
+_INDICF5_PROMPT_GITHUB_SHA = "13f7c4d627cc10111aea8fe9c0039462cacacdc7"
+_INDICF5_PROMPT_CACHE: Optional[tuple[Path, str]] = None
+_INDICF5_PROMPT_WARNED = False
+
+
+def _indicf5_bundled_prompt() -> Optional[tuple[Path, str]]:
+    """
+    The fallback reference: correct language, known transcript, wrong voice.
+
+    Only reached when no transcript could be aligned to the speaker's own clip.
+    Fetched rather than vendored, so it costs nothing in the tree and always
+    matches a pinned revision. Returns None if neither source is reachable, and
+    the caller then decides what to do about it.
+    """
+    global _INDICF5_PROMPT_CACHE
+
+    if _INDICF5_PROMPT_CACHE is not None:
+        return _INDICF5_PROMPT_CACHE
+
+    try:
+        from huggingface_hub import hf_hub_download
+
+        revision = (config.INDICF5_REVISION or "").strip() or None
+        path = hf_hub_download(
+            repo_id=config.INDICF5_MODEL_ID,
+            filename=_INDICF5_PROMPT_FILE,
+            revision=revision,
+        )
+        _INDICF5_PROMPT_CACHE = (Path(path), _INDICF5_PROMPT_TEXT)
+        return _INDICF5_PROMPT_CACHE
+    except Exception as exc:
+        log.debug("IndicF5 bundled prompt not on the Hub (%s); trying GitHub.", exc)
+
+    try:
+        import tempfile
+        import urllib.request
+
+        # Deterministic name keyed by the pinned commit, so repeat runs reuse the
+        # file and a re-pin fetches a fresh one instead of serving a stale clip.
+        cached = (
+            Path(tempfile.gettempdir())
+            / f"indicf5_prompt_{_INDICF5_PROMPT_GITHUB_SHA[:12]}_{Path(_INDICF5_PROMPT_FILE).name}"
+        )
+        if not cached.exists() or cached.stat().st_size == 0:
+            url = (
+                f"https://raw.githubusercontent.com/{_INDICF5_PROMPT_GITHUB_REPO}/"
+                f"{_INDICF5_PROMPT_GITHUB_SHA}/{_INDICF5_PROMPT_FILE}"
+            )
+            with urllib.request.urlopen(url, timeout=30) as response:
+                data = response.read()
+            if not data:
+                raise RuntimeError("empty response")
+            cached.write_bytes(data)
+        _INDICF5_PROMPT_CACHE = (cached, _INDICF5_PROMPT_TEXT)
+        return _INDICF5_PROMPT_CACHE
+    except Exception as exc:
+        log.debug("Could not fetch IndicF5 bundled prompt from GitHub: %s", exc)
+        return None
+
+
+def _indicf5_reference(ref_audio: Path, ref_text: str) -> tuple[Path, str]:
+    """
+    Settle what to condition on.
+
+    IndicF5 wants a clip *and* its transcript. Handed an empty transcript it
+    quietly loads whisper-large-v3-turbo to invent one, which is ~1.6 GB of VRAM
+    inside the TTS stage on a card that has none spare, plus a silent download.
+    speakers.py supplies real transcripts precisely so that never happens; this
+    is the guard for when it could not.
+    """
+    global _INDICF5_PROMPT_WARNED
+
+    text = (ref_text or "").strip()
+    if text:
+        return ref_audio, text
+
+    if config.INDICF5_USE_BUNDLED_PROMPT:
+        bundled = _indicf5_bundled_prompt()
+        if bundled is not None:
+            if not _INDICF5_PROMPT_WARNED:
+                log.warning(
+                    "No transcript for the reference clip, so falling back to IndicF5's "
+                    "bundled prompt. Pronunciation stays correct but the cloned voice is "
+                    "lost for this speaker. Run with --multi_voice (or supply TTS_REF_TEXT) "
+                    "to keep the original voice."
+                )
+                _INDICF5_PROMPT_WARNED = True
+            return bundled
+
+    if not _INDICF5_PROMPT_WARNED:
+        log.warning(
+            "No transcript for the reference clip and no bundled prompt available. "
+            "IndicF5 will transcribe the reference itself, which loads "
+            "whisper-large-v3-turbo (~1.6 GB VRAM) inside the TTS stage."
+        )
+        _INDICF5_PROMPT_WARNED = True
+    return ref_audio, ""
+
+
+def _unload_indicf5_model() -> None:
+    global _INDICF5_MODEL, _INDICF5_DEVICE
+
+    if _INDICF5_MODEL is None:
+        return
+    log.info("Unloading IndicF5 model...")
+    try:
+        del _INDICF5_MODEL
+        _INDICF5_MODEL = None
+        _INDICF5_DEVICE = None
+        _aggressive_gpu_cleanup(force=True)
+    except Exception as exc:
+        log.warning("Error unloading IndicF5 model: %s", exc)
+
+
+def _get_indicf5_model(use_cpu: bool = False):
+    """Load IndicF5, or hand back the already-loaded one."""
+    global _INDICF5_MODEL, _INDICF5_DEVICE
+
+    try:
+        import torch
+    except ImportError as exc:
+        raise ImportError("torch required for IndicF5. Run: pip install torch") from exc
+
+    vram = _get_vram_status()
+    if vram and vram.is_critical and not use_cpu:
+        log.warning("VRAM critical! Loading IndicF5 on CPU...")
+        use_cpu = True
+
+    if use_cpu or not torch.cuda.is_available():
+        device = "cpu"
+    else:
+        device = config.INDICF5_DEVICE or "cuda:0"
+
+    if _INDICF5_MODEL is not None and _INDICF5_DEVICE == device:
+        return _INDICF5_MODEL, device
+
+    if _INDICF5_MODEL is not None:
+        # Device changed (the CPU fallback ladder). Drop the old copy first.
+        _unload_indicf5_model()
+
+    from transformers import AutoModel
+
+    revision = (config.INDICF5_REVISION or "").strip() or None
+    log.info(
+        "Loading IndicF5 (%s%s) on %s ...",
+        config.INDICF5_MODEL_ID,
+        f"@{revision[:8]}" if revision else " @main",
+        device,
+    )
+    if not config.INDICF5_TRUST_REMOTE_CODE:
+        raise RuntimeError(
+            "IndicF5 ships its network definition as code in the model repo, so it "
+            "cannot load with INDICF5_TRUST_REMOTE_CODE=false. Either allow it "
+            "(it is pinned to INDICF5_REVISION) or use --tts_backend qwen3."
+        )
+
+    try:
+        model = AutoModel.from_pretrained(
+            config.INDICF5_MODEL_ID,
+            trust_remote_code=True,
+            revision=revision,
+        )
+    except Exception as exc:
+        raise RuntimeError(_indicf5_load_help(exc)) from exc
+
+    try:
+        model = model.to(device)
+    except Exception as exc:
+        if device == "cpu":
+            raise
+        log.warning("Could not move IndicF5 to %s (%s); falling back to CPU.", device, exc)
+        device = "cpu"
+        model = model.to(device)
+
+    _INDICF5_MODEL = model
+    _INDICF5_DEVICE = device
+    _log_vram_status("After IndicF5 load: ")
+    return model, device
+
+
+def _indicf5_load_help(exc: BaseException) -> str:
+    """Turn the two failures people actually hit into instructions."""
+    msg = str(exc)
+    lowered = msg.lower()
+
+    if "401" in msg or "gated" in lowered or "unauthorized" in lowered or "restricted" in lowered:
+        return (
+            f"IndicF5 ({config.INDICF5_MODEL_ID}) is a gated model. Accept the terms at "
+            f"https://huggingface.co/{config.INDICF5_MODEL_ID} while logged in, then put a "
+            f"token in HF_TOKEN. Original error: {msg}"
+        )
+    if "no module named 'f5_tts'" in lowered or "no module named \"f5_tts\"" in lowered:
+        return (
+            "IndicF5's remote code imports the f5_tts package, which is not installed. "
+            "Install it WITHOUT its dependencies:\n"
+            "    pip install --no-deps git+https://github.com/AI4Bharat/IndicF5.git\n"
+            "--no-deps matters: the project pins numpy<=1.26.4 and transformers<4.50, "
+            "which would downgrade this environment. The inference path runs fine on the "
+            f"versions already installed. Original error: {msg}"
+        )
+    return f"Could not load IndicF5: {msg}"
+
+
+class _IndicF5Engine(_TTSEngine):
+    """IndicF5: 11 Indian languages, cloning from a reference clip + transcript."""
+
+    name = "indicf5"
+
+    def language_name(self, target_lang: Optional[str]) -> str:
+        # Informational only. IndicF5 infers the language from the script, and
+        # has no language parameter to pass one to.
+        return (target_lang or "auto").strip().lower() or "auto"
+
+    def load(self, use_cpu: bool = False) -> tuple[object, str]:
+        return _get_indicf5_model(use_cpu=use_cpu)
+
+    def generate(
+        self,
+        model,
+        text: str,
+        language: str,
+        ref_audio: Path,
+        ref_text: str,
+        device: str = "cuda",
+    ) -> Tuple[bytes, int]:
+        try:
+            import io
+
+            import numpy as np
+            import soundfile as sf
+        except ImportError as exc:
+            raise ImportError(
+                "numpy and soundfile required for IndicF5. Run: pip install numpy soundfile"
+            ) from exc
+
+        _log_vram_status("Before IndicF5 generate: ")
+        clip, transcript = _indicf5_reference(ref_audio, ref_text)
+
+        audio = model(
+            text,
+            ref_audio_path=str(clip),
+            ref_text=transcript,
+        )
+
+        audio = np.asarray(audio)
+        if audio.size == 0:
+            raise RuntimeError("IndicF5 returned empty waveform")
+        # The model hands back int16 or float depending on its internal path;
+        # its own README normalizes exactly like this before writing.
+        if audio.dtype == np.int16:
+            audio = audio.astype(np.float32) / 32768.0
+        else:
+            audio = audio.astype(np.float32)
+
+        sample_rate = int(config.INDICF5_OUTPUT_SR)
+        buffer = io.BytesIO()
+        sf.write(buffer, audio, sample_rate, format="WAV")
+        buffer.seek(0)
+        return buffer.read(), sample_rate
+
+    def unload(self) -> None:
+        _unload_indicf5_model()
+
+
+# Constructing an engine must stay side-effect free — unload_tts_model() builds
+# one for every registered backend so that a backend which was never used still
+# reports "nothing loaded" rather than being skipped.
+_ENGINE_FACTORIES: dict[str, type] = {
+    "qwen3": _QwenEngine,
+    "indicf5": _IndicF5Engine,
+}
+_ENGINE_CACHE: dict[str, _TTSEngine] = {}
+
+
+def resolve_tts_backend(
+    target_lang: Optional[str], requested: Optional[str] = None
+) -> str:
+    """
+    Pick the backend for a target language.
+
+    'auto' routes by language, because the failure it prevents is silent: Qwen3
+    supports ten languages and no Indic one, and handed 'gu' it does not refuse
+    -- it falls back to auto-detect and generates confident nonsense. Routing is
+    the difference between a wrong model and no model.
+
+    An explicitly named backend always wins, including when it is the wrong fit.
+    Forcing one is how you A/B them, and second-guessing an explicit flag makes
+    that impossible.
+    """
+    requested = (requested or "").strip().lower()
+    if requested and requested != "auto":
+        return requested
+
+    code = (target_lang or "").strip().lower()
+    # Accept 'hi-IN', 'pa_Guru' and friends -- only the language subtag routes.
+    base = re.split(r"[-_]", code)[0] if code else ""
+
+    if base in _INDICF5_LANGS:
+        return "indicf5"
+    return "qwen3"
+
+
+def _get_engine(backend: Optional[str]) -> _TTSEngine:
+    """Resolve a backend name to its (cached) engine."""
+    key = (backend or "").strip().lower()
+    factory = _ENGINE_FACTORIES.get(key)
+    if factory is None:
+        supported = ", ".join(sorted(_ENGINE_FACTORIES))
+        raise ValueError(f"Backend '{backend}' not supported. Use one of: {supported}.")
+    engine = _ENGINE_CACHE.get(key)
+    if engine is None:
+        engine = factory()
+        _ENGINE_CACHE[key] = engine
+    return engine
+
+
 def _generate_with_oom_fallback(
+    engine: _TTSEngine,
     model,
     device: str,
     *,
@@ -846,11 +1269,11 @@ def _generate_with_oom_fallback(
                 status.allocated_gb,
                 status.free_gb,
             )
-            _unload_qwen3_model()
-            model, device = _get_qwen3_model(use_cpu=True)
+            engine.unload()
+            model, device = engine.load(use_cpu=True)
 
     try:
-        audio_bytes, sample_rate = _qwen3_generate_single(
+        audio_bytes, sample_rate = engine.generate(
             model=model,
             text=text,
             language=language,
@@ -869,7 +1292,7 @@ def _generate_with_oom_fallback(
                 log.warning("OOM during generation. Retrying once on GPU after cleanup...")
                 _aggressive_gpu_cleanup(force=True)
                 try:
-                    audio_bytes, sample_rate = _qwen3_generate_single(
+                    audio_bytes, sample_rate = engine.generate(
                         model=model,
                         text=text,
                         language=language,
@@ -885,9 +1308,9 @@ def _generate_with_oom_fallback(
             else:
                 log.warning("CUDA execution failure during generation (%s). Switching to CPU fallback.", e)
 
-            _unload_qwen3_model()
-            model, device = _get_qwen3_model(use_cpu=True)
-            audio_bytes, sample_rate = _qwen3_generate_single(
+            engine.unload()
+            model, device = engine.load(use_cpu=True)
+            audio_bytes, sample_rate = engine.generate(
                 model=model,
                 text=text,
                 language=language,
@@ -901,7 +1324,8 @@ def _generate_with_oom_fallback(
         raise
 
 
-def _synthesize_qwen3_chunked(
+def _synthesize_chunked(
+    engine: _TTSEngine,
     text: str,
     out_dir: Path,
     *,
@@ -918,17 +1342,23 @@ def _synthesize_qwen3_chunked(
     text = _clean_text(text)
     if not text:
         raise ValueError("Empty text for synthesis")
-    
+
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    
+
     # Prepare reference
     ref_max_seconds = max(1.0, float(getattr(config, "TTS_SPEAKER_REF_MAX_SECONDS", 6.0)))
     ref_path = _resolve_reference_audio(ref_audio or config.TTS_REF_AUDIO or None)
     ref_path = _prepare_reference_audio(ref_path, out_dir, max_seconds=ref_max_seconds)
     safe_ref_text = _clean_text(ref_text or "")
-    language = _qwen3_language_name(target_lang)
-    
+    language = engine.language_name(target_lang)
+    log.info(
+        "TTS backend '%s' synthesizing %s (language hint: %s).",
+        engine.name,
+        target_lang or "unspecified",
+        language,
+    )
+
     # Chunk text (adaptive by GPU tier)
     profile = config.get_runtime_profile()
     if use_cpu:
@@ -942,22 +1372,23 @@ def _synthesize_qwen3_chunked(
         raise ValueError("No valid chunks after cleaning")
     
     log.info(f"Synthesizing {len(chunks)} chunks (max {max_chars} chars each)...")
-    
+
     # Get model
-    model, device = _get_qwen3_model(use_cpu=use_cpu)
-    
+    model, device = engine.load(use_cpu=use_cpu)
+
     out_parts: List[Path] = []
     batch_size = int(profile.get("tts_batch_size", 2)) if device == "cuda" else 1
     batch_size = max(1, batch_size)
-    
+
     for batch_start in range(0, len(chunks), batch_size):
         batch_end = min(batch_start + batch_size, len(chunks))
-        
+
         for idx in range(batch_start, batch_end):
             chunk = chunks[idx]
             wav_part = out_dir / f"{output_stem}_{idx:04d}.wav"
 
             audio_bytes, sample_rate, model, device = _generate_with_oom_fallback(
+                engine,
                 model,
                 device,
                 text=chunk,
@@ -985,7 +1416,8 @@ def _synthesize_qwen3_chunked(
     return out_wav
 
 
-def _synthesize_qwen3_timed_segments(
+def _synthesize_timed_segments(
+    engine: _TTSEngine,
     segments: List[dict],
     out_dir: Path,
     *,
@@ -998,11 +1430,12 @@ def _synthesize_qwen3_timed_segments(
     speaker_refs: Optional[dict] = None,
 ) -> Path:
     """
-    Timed segment synthesis for Qwen3 with memory management.
+    Timed segment synthesis with memory management.
 
-    *speaker_refs* maps speaker_id -> reference wav (from speakers.py). A
-    segment whose speaker has no entry falls back to the global reference, so
-    a bit-part speaker with too little clean audio still gets dubbed.
+    *speaker_refs* maps speaker_id -> SpeakerRef (from speakers.py), or to a
+    bare reference wav path. A segment whose speaker has no entry falls back to
+    the global reference, so a bit-part speaker with too little clean audio
+    still gets dubbed.
     """
     out_dir = Path(out_dir)
     seg_dir = out_dir / "tts_segments"
@@ -1023,12 +1456,19 @@ def _synthesize_qwen3_timed_segments(
     default_ref = _resolve_reference_audio(ref_audio or config.TTS_REF_AUDIO or None)
     default_ref = _prepare_reference_audio(default_ref, seg_dir, max_seconds=ref_max_seconds)
     safe_ref_text = _clean_text(ref_text or "")
-    language = _qwen3_language_name(target_lang)
+    language = engine.language_name(target_lang)
+    log.info(
+        "TTS backend '%s' synthesizing %d segment(s) of %s (language hint: %s).",
+        engine.name,
+        len(segments),
+        target_lang or "unspecified",
+        language,
+    )
 
     # Prepared references are cached per speaker: the conditioning changes
     # between segments, but the model is loaded once for the whole run.
     speaker_refs = speaker_refs or {}
-    prepared_refs: dict[str, Path] = {}
+    prepared_refs: dict[str, tuple[Path, str]] = {}
     if speaker_refs:
         log.info(
             "Multi-voice synthesis: %d cloned voice(s) available (%s).",
@@ -1036,13 +1476,26 @@ def _synthesize_qwen3_timed_segments(
             ", ".join(sorted(str(k) for k in speaker_refs)),
         )
 
-    def _ref_for(speaker_id: str) -> Path:
-        """Resolve (and cache) the reference clip for one speaker."""
+    def _ref_for(speaker_id: str) -> tuple[Path, str]:
+        """
+        Resolve (and cache) the reference clip and transcript for one speaker.
+
+        The transcript travels with the clip because reference-conditioned
+        backends need both, and they have to describe the same speech. Returning
+        the clip alone and reusing the global ref_text would pair one speaker's
+        audio with another speaker's words.
+        """
         if speaker_id in prepared_refs:
             return prepared_refs[speaker_id]
 
         candidate = speaker_refs.get(speaker_id)
-        resolved = default_ref
+        # speakers.py returns SpeakerRef(audio, text); a bare path is still
+        # accepted so callers that build references themselves keep working.
+        candidate_text = getattr(candidate, "text", "")
+        candidate = getattr(candidate, "audio", candidate)
+        # Falling back to the default clip means falling back to its transcript
+        # too; a per-speaker transcript is only valid for that speaker's clip.
+        resolved, resolved_text = default_ref, safe_ref_text
         if candidate:
             try:
                 candidate = Path(candidate)
@@ -1055,6 +1508,7 @@ def _synthesize_qwen3_timed_segments(
                         max_seconds=ref_max_seconds,
                         out_name=f"ref_clip_{speaker_id}.wav",
                     )
+                    resolved_text = _clean_text(candidate_text or "")
                 else:
                     log.warning(
                         "Reference for %s missing at %s; using the default voice.",
@@ -1063,11 +1517,11 @@ def _synthesize_qwen3_timed_segments(
                     )
             except Exception as exc:
                 log.warning("Could not prepare reference for %s: %s", speaker_id, exc)
-        prepared_refs[speaker_id] = resolved
-        return resolved
+        prepared_refs[speaker_id] = (resolved, resolved_text)
+        return prepared_refs[speaker_id]
 
     # Get model
-    model, device = _get_qwen3_model(use_cpu=use_cpu)
+    model, device = engine.load(use_cpu=use_cpu)
     profile = config.get_runtime_profile()
     cleanup_every = max(1, int(profile.get("tts_cleanup_every", 3)))
 
@@ -1076,7 +1530,7 @@ def _synthesize_qwen3_timed_segments(
         start = float(seg.get("start", 0.0))
         end = float(seg.get("end", start))
         target_dur = max(0.05, end - start)
-        ref_path = _ref_for(str(seg.get("speaker_id") or "spk_00"))
+        ref_path, seg_ref_text = _ref_for(str(seg.get("speaker_id") or "spk_00"))
 
         if not text:
             continue
@@ -1111,12 +1565,13 @@ def _synthesize_qwen3_timed_segments(
             last_dur = 0.0
             for attempt in range(2):
                 audio_bytes, sample_rate, model, device = _generate_with_oom_fallback(
+                    engine,
                     model,
                     device,
                     text=chunk_text,
                     language=language,
                     ref_audio=ref_path,
-                    ref_text=safe_ref_text,
+                    ref_text=seg_ref_text,
                 )
                 part_wav.write_bytes(audio_bytes)
                 last_dur = _wav_duration(part_wav)
@@ -1140,8 +1595,8 @@ def _synthesize_qwen3_timed_segments(
                         last_rms,
                     )
                     if device != "cpu":
-                        _unload_qwen3_model()
-                        model, device = _get_qwen3_model(use_cpu=True)
+                        engine.unload()
+                        model, device = engine.load(use_cpu=True)
                 else:
                     log.warning(
                         "Segment %d chunk %d remained low-energy after retry (dur=%.2fs, rms=%.1f). Keeping best effort output.",
@@ -1258,20 +1713,18 @@ def synthesize(
     Args:
         use_cpu: Force CPU processing (slower but memory-safe for long videos)
     """
-    backend = (tts_backend or config.TTS_BACKEND).lower()
-    
-    if backend == "qwen3":
-        return _synthesize_qwen3_chunked(
-            text,
-            out_dir,
-            output_stem=output_stem,
-            target_lang=target_lang,
-            ref_audio=ref_audio,
-            ref_text=ref_text,
-            use_cpu=use_cpu,
-        )
-    
-    raise ValueError(f"Backend '{backend}' not supported in optimized mode. Use 'qwen3'.")
+    backend = resolve_tts_backend(target_lang, tts_backend or config.TTS_BACKEND)
+
+    return _synthesize_chunked(
+        _get_engine(backend),
+        text,
+        out_dir,
+        output_stem=output_stem,
+        target_lang=target_lang,
+        ref_audio=ref_audio,
+        ref_text=ref_text,
+        use_cpu=use_cpu,
+    )
 
 
 def synthesize_timed_segments(
@@ -1290,27 +1743,36 @@ def synthesize_timed_segments(
     """
     Timed segment synthesis.
 
-    *speaker_refs* maps speaker_id -> reference wav for multi-voice dubbing.
-    Omit it (or pass an empty dict) for the single-voice behaviour.
+    *speaker_refs* maps speaker_id -> SpeakerRef (or a bare reference wav) for
+    multi-voice dubbing. Omit it (or pass an empty dict) for single-voice.
     """
-    backend = (tts_backend or config.TTS_BACKEND).lower()
+    backend = resolve_tts_backend(target_lang, tts_backend or config.TTS_BACKEND)
 
-    if backend == "qwen3":
-        return _synthesize_qwen3_timed_segments(
-            segments,
-            out_dir,
-            output_stem=output_stem,
-            target_lang=target_lang,
-            ref_audio=ref_audio,
-            ref_text=ref_text,
-            no_duration_match=no_duration_match,
-            use_cpu=use_cpu,
-            speaker_refs=speaker_refs,
-        )
-
-    raise ValueError(f"Backend '{backend}' not supported. Use 'qwen3'.")
+    return _synthesize_timed_segments(
+        _get_engine(backend),
+        segments,
+        out_dir,
+        output_stem=output_stem,
+        target_lang=target_lang,
+        ref_audio=ref_audio,
+        ref_text=ref_text,
+        no_duration_match=no_duration_match,
+        use_cpu=use_cpu,
+        speaker_refs=speaker_refs,
+    )
 
 
 def unload_tts_model():
-    """Public function to unload TTS model and free memory."""
-    _unload_qwen3_model()
+    """
+    Unload every TTS backend and free memory.
+
+    Sequential load/unload is the whole VRAM strategy — peak usage stays at the
+    largest single stage only if the previous stage actually let go. A run that
+    routed to more than one backend must release all of them, so every
+    registered engine is asked, not just the one that ran last.
+    """
+    for name in _ENGINE_FACTORIES:
+        try:
+            _get_engine(name).unload()
+        except Exception as exc:
+            log.warning("Could not unload TTS backend '%s': %s", name, exc)
