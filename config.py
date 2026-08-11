@@ -145,9 +145,12 @@ TRANSLATION_MAX_CHUNK_CHARS: int = int(os.environ.get("TRANSLATION_MAX_CHUNK_CHA
 # TTS Settings
 # =============================================================================
 
-TTS_BACKEND: str = os.environ.get("TTS_BACKEND", "qwen3").lower()
-if TTS_BACKEND != "qwen3":
-    TTS_BACKEND = "qwen3"
+# "auto" routes by target language: Indic targets go to IndicF5, everything else
+# to Qwen3. Naming a backend explicitly overrides that and is honoured even when
+# the language is a poor fit, because forcing one backend is how you A/B them.
+TTS_BACKEND: str = os.environ.get("TTS_BACKEND", "auto").lower()
+if TTS_BACKEND not in {"auto", "qwen3", "indicf5"}:
+    TTS_BACKEND = "auto"
 
 # Generic reference voice settings.
 TTS_REF_AUDIO: str = os.environ.get("TTS_REF_AUDIO", "ref_voice.wav")
@@ -233,6 +236,47 @@ QWEN3_ULTRA_LOW_VRAM_BATCH_SIZE: int = int(os.environ.get("QWEN3_ULTRA_LOW_VRAM_
 QWEN3_ULTRA_LOW_VRAM_CLEANUP_EVERY: int = int(
     os.environ.get("QWEN3_ULTRA_LOW_VRAM_CLEANUP_EVERY", "1")
 )
+
+# =============================================================================
+# IndicF5 Settings (Local)
+# =============================================================================
+#
+# IndicF5 covers the 11 Indian languages Qwen3-TTS has none of: Assamese,
+# Bengali, Gujarati, Hindi, Kannada, Malayalam, Marathi, Odia, Punjabi, Tamil,
+# Telugu. It takes no language argument -- the script tells it which language it
+# is reading -- so there is no language map on this side.
+
+INDICF5_MODEL_ID: str = os.environ.get("INDICF5_MODEL_ID", "ai4bharat/IndicF5")
+
+# Pin the snapshot. `trust_remote_code` executes model.py from the repo, so
+# tracking a moving `main` means an upstream push silently changes what runs on
+# this machine. Set to "" only if you deliberately want the latest.
+INDICF5_REVISION: str = os.environ.get(
+    "INDICF5_REVISION", "ba85abedf18dc479a447eaa0eccbd76ab78a47d5"
+)
+
+# Required by the model: its weights ship with the code that builds the network.
+# Left as a switch so the execution is a visible, auditable decision rather than
+# something buried in a call site.
+INDICF5_TRUST_REMOTE_CODE: bool = os.environ.get(
+    "INDICF5_TRUST_REMOTE_CODE", "true"
+).lower() in {"1", "true", "yes", "on"}
+
+INDICF5_DEVICE: str = os.environ.get("INDICF5_DEVICE", "cuda:0")
+INDICF5_OUTPUT_SR: int = int(os.environ.get("INDICF5_OUTPUT_SR", "24000"))
+
+# Reference conditioning. IndicF5 needs the reference clip *and* its transcript;
+# with an empty transcript it quietly loads whisper-large-v3-turbo to make one,
+# which costs ~1.6 GB of VRAM inside the TTS stage on a card that has none to
+# spare. speakers.py supplies real transcripts, so that path should stay unused.
+#
+# When enabled and no transcript is available, fall back to a bundled prompt
+# from the model repo (correct language, known transcript, but a stranger's
+# voice) instead of letting the model transcribe. Voice identity is lost;
+# pronunciation is not.
+INDICF5_USE_BUNDLED_PROMPT: bool = os.environ.get(
+    "INDICF5_USE_BUNDLED_PROMPT", "true"
+).lower() in {"1", "true", "yes", "on"}
 
 # =============================================================================
 # Cloud TTS (Sarvam) - Alternative to local

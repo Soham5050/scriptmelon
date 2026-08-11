@@ -49,6 +49,11 @@ training_runs/
 _*.log
 _handoff_*.md
 
+# Scratch clones and upstream sources pulled down to read while integrating a
+# dependency. Reference material, not project code -- the reproducible install
+# lives in requirements.txt.
+.scratch/
+
 # Installers and partial browser downloads that land in the repo root
 *.exe
 *.msi
