@@ -3,6 +3,10 @@
 # Install from the project root:
 #   python -m pip install -U pip setuptools wheel
 #   python -m pip install -r requirements.txt
+#   python -m pip install --no-deps git+https://github.com/ai4bharat/IndicF5.git
+#
+# That last line is a separate step because pip requirements files cannot carry
+# --no-deps, and IndicF5 must be installed without it. See the IndicF5 block below.
 #
 # System dependency:
 #   FFmpeg must be installed and available on PATH.
@@ -29,6 +33,36 @@ protobuf>=3.20.0
 
 # Local Qwen3-TTS package
 -e ./Qwen3-TTS
+
+# IndicF5 (Indic-language TTS) -- installed separately, on purpose:
+#
+#   python -m pip install --no-deps git+https://github.com/ai4bharat/IndicF5.git
+#
+# The --no-deps is required, not a shortcut. IndicF5's own requirements.txt
+# declares numpy<=1.26.4 and transformers<4.50; both pins are stale. A plain
+# install silently downgrades numpy 2.x -> 1.26.4 and transformers 4.57 -> 4.49,
+# which breaks Qwen3-TTS (pinned transformers==4.57.3 above), torch 2.8, whisperx
+# and demucs. Verified: f5_tts imports and runs fine against numpy 2.3.5 /
+# transformers 4.57.3, so the pins are the problem, not the code.
+#
+# Because --no-deps installs nothing, f5_tts's real import closure is pinned here
+# instead. Probed by importing f5_tts.infer.utils_infer and f5_tts.model and
+# reading sys.modules, so this is what it actually needs, not what it declares.
+# wandb looks out of place but f5_tts/model/trainer.py imports it at module level,
+# so `import f5_tts.model` fails without it.
+jieba>=0.42.1
+vocos>=0.1.0
+x-transformers>=1.31.14
+torchdiffeq>=0.2.5
+ema-pytorch>=0.5.2
+pypinyin>=0.53
+pydub>=0.25.1
+matplotlib>=3.8
+click>=8.1
+wandb>=0.17
+# Not in that closure, but f5_tts/api.py needs it and the IndicF5 HF repo's
+# trust_remote_code module is gated, so we cannot confirm it stays clear of api.py.
+cached-path>=1.6
 
 # Audio, DSP, and source separation
 numpy>=2.0,<3
@@ -63,6 +97,6 @@ datasets>=4.5.0
 scikit-learn>=1.4.0
 pandas>=2.2.0
 
-# Optional quality/research extras:
-# sacrebleu>=2.4.0
-# sentence-transformers>=2.5.0
+# Quality/research extras
+sacrebleu>=2.4.0
+sentence-transformers>=2.5.0

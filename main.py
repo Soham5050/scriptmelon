@@ -26,7 +26,13 @@ from merge import merge_audio
 from separation import separate_dialogue_and_bed
 from transcribe import transcribe, transcribe_with_timestamps, unload_asr_resources
 from translate import translate, translate_texts_batch, unload_translation_model
-from tts import synthesize, synthesize_timed_segments, unload_tts_model, _concat_wavs as _tts_concat_wavs
+from tts import (
+    synthesize,
+    synthesize_timed_segments,
+    unload_tts_model,
+    resolve_tts_backend,
+    _concat_wavs as _tts_concat_wavs,
+)
 from speakers import select_speaker_reference_clips
 
 log = config.get_logger("main")
@@ -195,6 +201,11 @@ def _estimate_timings_from_text(full_text: str, total_duration: float) -> List[d
                 "start": round(start, 3),
                 "end": round(end, 3),
                 "text": sent,
+                # These are sentences of the *translation*, split by word ratio,
+                # with no ASR segment behind them — there is no source text to
+                # pair with the audio at these times. Empty, and explicitly so,
+                # keeps voice-cloning references from quoting the wrong language.
+                "source_text": "",
                 "estimated": True,
             }
         )
@@ -448,6 +459,12 @@ def _run_chunked(input_path, output_path, work_dir, args, use_cpu_for_tts: bool,
     separator = "=" * 64
     start_time = time.time()
     input_stat = input_path.stat()
+    # Resolve "auto" once, up front, so the banner, the run report and the manifest
+    # all name the backend that actually synthesizes. The resume fingerprint below
+    # keeps the *requested* value on purpose: the resolved one is a pure function of
+    # it and target_lang, which is already in the key, so resolving there would only
+    # invalidate existing caches without distinguishing anything new.
+    tts_backend = resolve_tts_backend(args.target_lang, args.tts_backend or config.TTS_BACKEND)
     resume_key = "|".join(
         [
             str(input_path.resolve()),
@@ -467,7 +484,7 @@ def _run_chunked(input_path, output_path, work_dir, args, use_cpu_for_tts: bool,
         "src_lang": args.src_lang,
         "target_lang": args.target_lang,
         "translation_backend": args.backend or config.TRANSLATION_BACKEND,
-        "tts_backend": args.tts_backend or config.TTS_BACKEND,
+        "tts_backend": tts_backend,
         "duration_match_enabled": not args.no_duration_match,
         "preserve_bgm": bool(getattr(args, "preserve_bgm", False)),
         "resume_enabled": bool(getattr(args, "resume", False)),
@@ -481,7 +498,12 @@ def _run_chunked(input_path, output_path, work_dir, args, use_cpu_for_tts: bool,
     log.info("Output  : %s", output_path)
     log.info("Language: %s -> %s", args.src_lang, args.target_lang)
     log.info("Backend : %s", args.backend or config.TRANSLATION_BACKEND)
-    log.info("TTS     : %s (CPU=%s)", args.tts_backend or config.TTS_BACKEND, use_cpu_for_tts)
+    requested_tts = (args.tts_backend or config.TTS_BACKEND).strip().lower()
+    log.info(
+        "TTS     : %s (CPU=%s)",
+        tts_backend if requested_tts == tts_backend else f"{requested_tts} -> {tts_backend}",
+        use_cpu_for_tts,
+    )
     log.info("Duration Match: %s", "disabled" if args.no_duration_match else "enabled")
     log.info(separator)
     
@@ -791,6 +813,13 @@ def _run_chunked(input_path, output_path, work_dir, args, use_cpu_for_tts: bool,
             translation = str(translation_ckpt.get("translation") or "").strip()
             ts = translation_ckpt.get("translated_segments")
             translated_segments = ts if isinstance(ts, list) else []
+            # Checkpoints written before source_text existed carry only the
+            # translated `text`. Absent means "fall back to text", which would
+            # hand a voice-cloning reference a transcript in the target
+            # language, so say explicitly that no source text is available.
+            for seg in translated_segments:
+                if isinstance(seg, dict):
+                    seg.setdefault("source_text", "")
             src = str(translation_ckpt.get("source_lang") or src)
             log.info(
                 "      Loaded translation checkpoint (chars=%d, segments=%d)",
@@ -828,6 +857,7 @@ def _run_chunked(input_path, output_path, work_dir, args, use_cpu_for_tts: bool,
                             "start": float(seg["start"]),
                             "end": float(seg["end"]),
                             "text": src_text,
+                            "source_text": src_text,
                             "speaker_id": str(seg.get("speaker_id", "spk_00")),
                         }
                     )
@@ -861,6 +891,10 @@ def _run_chunked(input_path, output_path, work_dir, args, use_cpu_for_tts: bool,
                         "start": float(seg["start"]),
                         "end": float(seg["end"]),
                         "text": tgt_text.strip(),
+                        # Kept for voice-cloning references: the reference clip
+                        # is original speech, so its transcript has to be the
+                        # source text, not the translation.
+                        "source_text": (seg.get("text") or "").strip(),
                         "speaker_id": str(seg.get("speaker_id", "spk_00")),
                     })
 
@@ -944,8 +978,7 @@ def _run_chunked(input_path, output_path, work_dir, args, use_cpu_for_tts: bool,
             log.info("      (Using CPU for TTS - memory-safe mode)")
         
         step_start = time.time()
-        
-        tts_backend = (args.tts_backend or config.TTS_BACKEND).lower()
+
         ref_audio = args.ref_audio or config.TTS_REF_AUDIO or None
         # Avoid implicit fallback ref_text to prevent prompt-text leakage into speech.
         ref_text = args.ref_text or None
@@ -1271,7 +1304,15 @@ def build_parser():
     p.add_argument("--output", "-o", default=None, help="Output path")
     p.add_argument("--src_lang", "-s", default="en", help="Source language code")
     p.add_argument("--backend", "-b", default=None, choices=["indictrans2", "marian", "nllb", "google"])
-    p.add_argument("--tts_backend", default=None, choices=["qwen3"], help="TTS backend")
+    p.add_argument(
+        "--tts_backend",
+        default=None,
+        choices=["auto", "qwen3", "indicf5"],
+        help=(
+            "TTS backend. 'auto' (default) routes Indic target languages to IndicF5 "
+            "and everything else to Qwen3. Name one explicitly to force it."
+        ),
+    )
     
     p.add_argument("--no_duration_match", action="store_true", 
                    help="Disable time-stretching to ASR timestamps")

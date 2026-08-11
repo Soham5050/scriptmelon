@@ -95,8 +95,17 @@ TARGET_CODES  = LANG_CODES[1:]
 BACKENDS     = ["Auto", "Google", "IndicTrans2", "Marian", "NLLB"]
 BACKEND_VALS = ["",     "google", "indictrans2", "marian", "nllb"]
 
-INDIC_LANGS  = {"hi","mr","bn","te","ta","gu","kn","ml","pa","or","as","ur"}
 QWEN_LANGS   = {"en","zh","ja","ko","de","fr","ru","pt","es","it"}
+
+# Mirrors tts._INDICF5_LANGS. Duplicated rather than imported because this GUI is
+# a thin launcher for main.py -- importing tts would drag torch into startup and
+# probe VRAM before the window even opens. tests/test_tts_routing.py asserts the
+# two sets stay in step so the routing hint below cannot quietly start lying.
+# Urdu is deliberately absent: IndicF5 covers 11 languages and Urdu is not one.
+INDICF5_LANGS = {"as","bn","gu","hi","kn","ml","mr","or","pa","ta","te"}
+
+TTS_BACKENDS     = ["Auto", "Qwen3", "IndicF5"]
+TTS_BACKEND_VALS = ["auto", "qwen3", "indicf5"]
 
 PROGRESS_STEPS = {
     "[1/5]": (14,  "Preparing audio"),
@@ -116,7 +125,7 @@ state = {
     "src_idx":           0,
     "tgt_idx":           1,
     "backend_idx":       1,   # Google
-    "tts_backend":       "qwen3",
+    "tts_backend":       "auto",
     "keep_temp":         True,
     "verbose":           True,
     "interactive":       False,
@@ -310,12 +319,32 @@ def _refresh_command():
         dpg.set_value("cmd_text", text)
 
 
+def _resolved_tts_backend() -> str:
+    """Mirror of tts.resolve_tts_backend so the hint can name the engine that will
+    actually run instead of the word the user picked."""
+    requested = str(state.get("tts_backend", "auto")).strip().lower()
+    if requested and requested != "auto":
+        return requested
+    return "indicf5" if _target_code() in INDICF5_LANGS else "qwen3"
+
+
 def _route_hint() -> tuple[str, tuple]:
     tgt = _target_code()
-    if tgt in INDIC_LANGS:
-        return f"Indic routing | Target: {tgt.upper()} | Validate pronunciation on final output.", C["warn"]
+    backend = _resolved_tts_backend()
+    if backend == "indicf5":
+        if tgt in INDICF5_LANGS:
+            return f"IndicF5 | Target: {tgt.upper()} | Trained on this language.", C["accent"]
+        return (
+            f"IndicF5 forced | Target: {tgt.upper()} | It only covers 11 Indian languages, "
+            "so expect garbage here.", C["warn"],
+        )
     if tgt in QWEN_LANGS:
         return f"Qwen3 native support | Target: {tgt.upper()} | Highest-confidence lane.", C["accent"]
+    if tgt in INDICF5_LANGS:
+        return (
+            f"Qwen3 forced | Target: {tgt.upper()} | Qwen3 has no Indian languages at all; "
+            "set TTS engine to Auto or IndicF5.", C["warn"],
+        )
     return f"Qwen3 multilingual transfer | Target: {tgt.upper()} | Run a short sample first.", C["muted"]
 
 
@@ -523,6 +552,15 @@ def on_tgt_change(sender, val):
 
 def on_backend_change(sender, val):
     state["backend_idx"] = BACKENDS.index(val) if val in BACKENDS else 0
+    _refresh_command()
+
+
+def on_tts_backend_change(sender, val):
+    state["tts_backend"] = (
+        TTS_BACKEND_VALS[TTS_BACKENDS.index(val)] if val in TTS_BACKENDS else "auto"
+    )
+    # The hint depends on the engine as well as the language, so it has to move.
+    _update_route_hint()
     _refresh_command()
 
 
@@ -845,7 +883,7 @@ def build_ui():
                 dpg.add_spacer(height=8)
 
                 # ── Language ──────────────────────────────────────────────────
-                with dpg.child_window(height=200, border=True, tag="lang_card"):
+                with dpg.child_window(height=250, border=True, tag="lang_card"):
                     section_header("LANGUAGE ROUTING")
                     with dpg.group(horizontal=True):
                         with dpg.group():
@@ -861,9 +899,17 @@ def build_ui():
                                          callback=on_tgt_change)
 
                     dpg.add_spacer(height=6)
-                    dpg.add_text("Translation backend", color=C["muted"])
-                    dpg.add_combo(BACKENDS, tag="backend_combo", default_value="Google",
-                                 width=395, callback=on_backend_change)
+                    with dpg.group(horizontal=True):
+                        with dpg.group():
+                            dpg.add_text("Translation backend", color=C["muted"])
+                            dpg.add_combo(BACKENDS, tag="backend_combo", default_value="Google",
+                                         width=190, callback=on_backend_change)
+                        dpg.add_spacer(width=8)
+                        with dpg.group():
+                            dpg.add_text("TTS engine", color=C["muted"])
+                            dpg.add_combo(TTS_BACKENDS, tag="tts_backend_combo",
+                                         default_value=TTS_BACKENDS[0], width=190,
+                                         callback=on_tts_backend_change)
 
                     dpg.add_spacer(height=8)
                     hint, col = _route_hint()
