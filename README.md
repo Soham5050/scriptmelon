@@ -19,8 +19,9 @@ transcript.txt  ("Hello, welcome to…")
    │  MarianMT / NLLB
 translation.txt ("नमस्ते, स्वागत है…")
    │
-   ▼  Qwen3-TTS (local, w/ voice    tts.py
-   │  cloning support)
+   ▼  IndicF5 / Qwen3-TTS (local,  tts.py
+   │  w/ voice cloning; routed by
+   │  target language)
 dubbed_audio.wav
    │
    ▼  FFmpeg                        merge.py
@@ -51,7 +52,7 @@ scriptmelon/
 ├── quality_metrics.py             ← ASR/translation/TTS quality scoring
 ├── quality_validation.py          ← Quality gate logic used mid-pipeline
 ├── speakers.py                     ← Per-speaker reference-clip selection for --multi_voice
-├── tts.py                          ← Step 4: Qwen3-TTS local speech synthesis + voice cloning
+├── tts.py                          ← Step 4: local speech synthesis + voice cloning (IndicF5 / Qwen3-TTS)
 ├── merge.py                         ← Step 5: FFmpeg audio-video merge
 ├── lipsync.py                        ← Step 6 (optional, --lipsync): NVIDIA Maxine LipSync
 ├── cleanup.py                         ← Housekeeping: delete leftover temp_dubbing_* directories
@@ -100,7 +101,7 @@ python3 --version   # must be 3.10+
   which additionally applies quantization automatically: `int8_float16` ASR
   compute (near-fp16 quality at roughly half the memory, so a 6GB card still
   runs the full `large-v3` Whisper model instead of a weaker one), and
-  8-bit translation. Qwen3-TTS is intentionally **not** quantized below
+  8-bit translation. The TTS model is intentionally **not** quantized below
   8-bit — 4-bit measurably degrades prosody, so the tradeoff isn't taken
   even on the smallest tier. Controlled by `ASR_COMPUTE_TYPE`,
   `TRANSLATION_QUANTIZATION`, and `TTS_QUANTIZATION` in `.env` — `auto`
@@ -120,10 +121,20 @@ source venv/bin/activate          # Windows: venv\Scripts\activate
 
 pip install --upgrade pip
 pip install -r requirements.txt
+pip install --no-deps git+https://github.com/ai4bharat/IndicF5.git
 ```
 
 `requirements.txt` installs the local `Qwen3-TTS` package in editable mode
 (`-e ./Qwen3-TTS`) — that folder must exist alongside `main.py`.
+
+IndicF5 is a separate line because it needs `--no-deps`, and pip requirements
+files can't carry that flag. Its own metadata pins `numpy<=1.26.4` and
+`transformers<4.50`; both are stale, and honouring them downgrades the
+environment out from under Qwen3-TTS (`transformers==4.57.3`), torch 2.8,
+whisperx and demucs. Its actual import closure is pinned in `requirements.txt`
+instead, so `--no-deps` leaves nothing missing. Skip this step and Indic
+languages fail at the TTS stage with an install hint rather than silently
+producing bad audio.
 
 ---
 
@@ -141,9 +152,10 @@ people actually need to look at:
 |---|---|---|
 | `TRANSCRIBE_BACKEND` | No (default `faster_whisper`) | `faster_whisper` (local) \| `whisperx` (local, alignment+diarization) \| `nvidia` (cloud) |
 | `NVIDIA_API_KEY` | Only if `TRANSCRIBE_BACKEND=nvidia` | NIM API key from https://ngc.nvidia.com |
-| `HF_TOKEN` | Only if `WHISPERX_DIARIZE_ENABLED=true` | HuggingFace token for gated pyannote diarization models |
+| `HF_TOKEN` | For IndicF5 TTS, and if `WHISPERX_DIARIZE_ENABLED=true` | HuggingFace token. Both `ai4bharat/IndicF5` and the pyannote diarization models are gated — accept their terms on the model page first |
 | `TRANSLATION_BACKEND` | No (default `indictrans2`) | `indictrans2` \| `marian` \| `nllb` \| `google` |
-| `TTS_REF_AUDIO` / `TTS_REF_TEXT` | No | Default voice-cloning reference (overridable per-run with `--ref_audio`/`--ref_text`) |
+| `TTS_BACKEND` | No (default `auto`) | `auto` routes by target language (see §6) \| `qwen3` \| `indicf5` |
+| `TTS_REF_AUDIO` / `TTS_REF_TEXT` | No | Default voice-cloning reference (overridable per-run with `--ref_audio`/`--ref_text`). IndicF5 needs the *text* to match the audio — supply both or neither |
 | `NVIDIA_MAXINE_API_KEY` | Only with `--lipsync` | Maxine cloud key (falls back to `NVIDIA_API_KEY` if unset) |
 
 ---
@@ -156,7 +168,8 @@ On first run, models download automatically and get cached in
 | Model | Backend | Trigger |
 |---|---|---|
 | `ai4bharat/indictrans2-en-indic-1B` (~4 GB) | Translation | `TRANSLATION_BACKEND=indictrans2` |
-| Qwen3-TTS 1.7B (~4-5 GB) | TTS | Always (default TTS backend) |
+| `ai4bharat/IndicF5` (0.4B) | TTS | Indic target language (see §6). Gated — needs `HF_TOKEN` |
+| Qwen3-TTS 1.7B (~4-5 GB) | TTS | Non-Indic target language, or `--tts_backend qwen3` |
 | faster-whisper `large-v3` | ASR | `TRANSCRIBE_BACKEND=faster_whisper` (default) |
 | Demucs `htdemucs` | Separation | `--separate_audio` / `--preserve_bgm` |
 
@@ -251,7 +264,7 @@ python studio_gui.py
 --output       / -o    Output path (default: output/<stem>_<lang>.mp4)
 --src_lang     / -s    Source language code, or 'auto' (default: en)
 --backend      / -b    Translation backend: indictrans2 | marian | nllb | google
---tts_backend           TTS backend: qwen3 (only option currently)
+--tts_backend           TTS backend: auto | qwen3 | indicf5 (default auto — routes by target language)
 
 --no_duration_match     Disable time-stretching to ASR timestamps
 --skip_quality_gate     Skip ASR quality gate (not recommended)
@@ -317,9 +330,10 @@ single-voice dubbing — it will not fail the run outright.
    voice. A speaker needs `DIARIZATION_MIN_SPEAKER_SECONDS` (default 1.5s)
    of clean speech to get a cloned voice; shorter appearances fall back to
    the default voice rather than failing the run.
-4. Each speaker's lines are synthesized with Qwen3-TTS conditioned on their
-   own reference clip — the model loads once for the whole run, only the
-   per-line voice conditioning changes.
+4. Each speaker's lines are synthesized by the routed TTS backend, conditioned
+   on their own reference clip — the model loads once for the whole run, only
+   the per-line voice conditioning changes. IndicF5 additionally uses the
+   transcript of that clip, taken from the ASR segments it was cut from.
 5. The dubbed lines are placed back on the original timeline and mixed
    against the separated background stem, so music and ambience from the
    source are preserved underneath the new dialogue.
@@ -335,26 +349,86 @@ single-voice dubbing — it will not fail the run outright.
 
 ---
 
-## 6. Language Code Reference
+## 6. Language Support
 
-| Code | Language  | IndicTrans2 | MarianMT | Google |
-|------|-----------|:-----------:|:--------:|:------:|
-| hi   | Hindi     | ✓           | ✓        | ✓      |
-| bn   | Bengali   | ✓           | ✓        | ✓      |
-| te   | Telugu    | ✓           | ✓        | ✓      |
-| ta   | Tamil     | ✓           | ✓        | ✓      |
-| mr   | Marathi   | ✓           | ✓        | ✓      |
-| gu   | Gujarati  | ✓           | ✓        | ✓      |
-| kn   | Kannada   | ✓           | ✓        | ✓      |
-| ml   | Malayalam | ✓           | ✓        | ✓      |
-| pa   | Punjabi   | ✓           | ✓        | ✓      |
-| es   | Spanish   | —           | ✓        | ✓      |
-| fr   | French    | —           | ✓        | ✓      |
-| de   | German    | —           | ✓        | ✓      |
-| ja   | Japanese  | —           | ✓        | ✓      |
+Translation and speech synthesis do **not** cover the same languages, and the gap
+used to be invisible. A language with a translation backend but no TTS model
+still produced a finished video — it just did not sound like the language. So the
+two are listed separately.
 
-For pairs `indictrans2` doesn't cover, use `--backend marian`, `--backend nllb`,
-or `--backend google`.
+### 6.1 Text-to-speech
+
+`--tts_backend auto` (the default) picks the engine from the target language.
+
+| Engine | Languages | Notes |
+|--------|-----------|-------|
+| **IndicF5** | `as` `bn` `gu` `hi` `kn` `ml` `mr` `or` `pa` `ta` `te` | 11 Indian languages. Gated on Hugging Face — accept the terms and set `HF_TOKEN`. |
+| **Qwen3-TTS** | `zh` `en` `ja` `ko` `de` `fr` `ru` `pt` `es` `it` | 10 languages. No Indian language among them. |
+| *neither* | everything else, including Urdu (`ur`) | `auto` sends these to Qwen3-TTS, which does not refuse — it falls back to language auto-detect and produces fluent-sounding nonsense. |
+
+Both engines clone the reference voice, so `--multi_voice` and `--ref_audio` work
+either way. Naming a backend explicitly (`--tts_backend qwen3`) overrides the
+routing even when the language is a bad fit — that is how you A/B the two.
+
+IndicF5 also wants the *transcript* of the reference clip, not just the clip.
+The pipeline derives it from the ASR segments the clip was cut from. If it cannot
+(`--no_clone`, or an externally supplied `--ref_audio` with no `--ref_text`), it
+falls back to a bundled Punjabi prompt and warns: pronunciation stays correct,
+but the original voice is lost for that speaker.
+
+### 6.2 Translation
+
+`--backend` defaults to auto-routing by language pair. Pairs that aren't in the
+routing table fall through to `TRANSLATION_BACKEND` (default `indictrans2`),
+which handles en↔Indic only — so for the non-Indic languages you have to name a
+backend yourself. It fails loudly (`Unknown language code for IndicTrans2`)
+rather than mistranslating, but it does fail.
+
+| Code | Language   | Auto-routed to | `--backend nllb` |
+|------|------------|----------------|:----------------:|
+| hi   | Hindi      | IndicTrans2    | ✓ |
+| bn   | Bengali    | IndicTrans2    | ✓ |
+| te   | Telugu     | IndicTrans2    | ✓ |
+| ta   | Tamil      | IndicTrans2    | ✓ |
+| mr   | Marathi    | IndicTrans2    | ✓ |
+| gu   | Gujarati   | IndicTrans2    | ✓ |
+| kn   | Kannada    | IndicTrans2    | ✓ |
+| ml   | Malayalam  | IndicTrans2    | ✓ |
+| pa   | Punjabi    | IndicTrans2    | ✓ |
+| ur   | Urdu       | IndicTrans2    | ✓ |
+| or   | Odia       | default backend handles it | ✓ |
+| as   | Assamese   | default backend handles it | ✓ |
+| es   | Spanish    | MarianMT       | ✓ |
+| fr   | French     | MarianMT       | ✓ |
+| de   | German     | MarianMT       | ✓ |
+| zh   | Chinese    | nothing — pass `--backend` | ✓ |
+| ja   | Japanese   | nothing — pass `--backend` | ✓ |
+| ko   | Korean     | nothing — pass `--backend` | ✓ |
+| ru   | Russian    | nothing — pass `--backend` | ✓ |
+| ar   | Arabic     | nothing — pass `--backend` | ✓ |
+| pt   | Portuguese | nothing — pass `--backend` | — |
+| it   | Italian    | nothing — pass `--backend` | — |
+
+What each backend can actually do:
+
+- **`indictrans2`** — en↔Indic only. Any other pair raises
+  `IndicTrans2 supports en<->Indic only`.
+- **`nllb`** — the ✓ column above; it needs a FLORES code for both sides, and
+  `pt`/`it` don't have one, so those two are the gaps. en↔X only.
+- **`marian`** — resolves `Helsinki-NLP/opus-mt-<src>-<tgt>` at runtime and does
+  not check the pair against a list first. If that model exists on the Hub it
+  works; if not you get `No Marian model for <src>-><tgt>`, and for non-English
+  pairs it retries by pivoting through English. Coverage is whatever
+  Helsinki-NLP published, so treat anything outside `es`/`fr`/`de` as worth a
+  test run rather than assumed.
+- **`google`** — every code above, no local model, no GPU. The reliable fallback
+  when a local backend has no path for your pair.
+
+### 6.3 Where the two line up
+
+The languages that work end to end today are the intersection: the 11 IndicF5
+languages and `en` `es` `fr` `de` `zh` `ja` `ko` `ru` `pt` `it` on Qwen3-TTS.
+Urdu is the notable hole — translation is solid, TTS has nothing.
 
 ---
 
@@ -373,7 +447,7 @@ temp_dubbing_lecture/
 ├── segments_translated.json ← translated segments with timestamps
 ├── review_transcript.txt   ← editable timeline (with --interactive)
 ├── checkpoint_*.json       ← per-step checkpoints (for --resume)
-└── dubbed_audio.wav        ← Qwen3-TTS synthesised voice
+└── dubbed_audio.wav        ← synthesised voice track
 ```
 
 ---
@@ -386,7 +460,7 @@ The modular design makes each step replaceable:
 |---|---|---|
 | Transcription | faster-whisper (default) | Set `TRANSCRIBE_BACKEND=whisperx` or `nvidia` in `.env`, or edit `transcribe.py` |
 | Translation | IndicTrans2 (default) | Set `TRANSLATION_BACKEND` in `.env`, or add a new backend in `translate.py` |
-| TTS | Qwen3-TTS | Edit `tts.py` — swap Qwen3-TTS for another backend if needed |
+| TTS | IndicF5 / Qwen3-TTS, routed by target language | Set `TTS_BACKEND` in `.env` or pass `--tts_backend`. To add an engine, subclass `_TTSEngine` in `tts.py` and register it in `_ENGINE_FACTORIES` — chunking, duration lock, timeline placement and the OOM/CPU fallback ladder are shared, so a new engine only implements load/generate/unload |
 | LipSync | NVIDIA Maxine | Edit `lipsync.py` — `apply_lipsync_wav2lip()` is provided as an offline alternative |
 
 ---
@@ -412,8 +486,12 @@ is a spectral-energy assertion rather than a listening judgment.
 | `ffmpeg: command not found` | Install FFmpeg and add to PATH |
 | `NVIDIA_API_KEY is not set for nvidia transcription backend` | Only relevant if `TRANSCRIBE_BACKEND=nvidia`; set the key in `.env` or switch to `faster_whisper` |
 | Audio > 25 MB (NVIDIA backend only) | Split with `ffmpeg -i v.mp4 -segment_time 600 -f segment seg_%03d.mp4` |
-| `No Helsinki-NLP model for pair` | Use `--backend google` or `--backend nllb` for that language pair |
+| `No Marian model for <src>-><tgt>` | Helsinki-NLP never published that pair. Use `--backend google`, or `--backend nllb` if both sides are in §6.2's ✓ column |
 | Qwen3-TTS `ImportError` | Confirm `Qwen3-TTS/` exists and reinstall with `pip install -e ./Qwen3-TTS` |
+| `No module named 'f5_tts'` on an Indic dub | IndicF5 wasn't installed — run the `pip install --no-deps git+...IndicF5.git` step from §2. Do **not** drop `--no-deps` |
+| `401` / gated-repo error loading IndicF5 | Accept the terms at https://huggingface.co/ai4bharat/IndicF5 and set `HF_TOKEN` in `.env`, or force `--tts_backend qwen3` (wrong-language audio, but it runs) |
+| Indic dub sounds fluent but is not the language | Backend routed to Qwen3-TTS, which has no Indian language. Check the `TTS :` banner line at run start; `auto` should show `indicf5` for those targets |
+| Indic dub loses the speaker's voice, warning about a bundled prompt | No transcript for the reference clip. IndicF5 needs `ref_audio` *and* matching `ref_text`; supply both, or let the pipeline derive them from ASR instead of passing `--ref_audio` alone |
 | Dubbed audio length mismatch | Use `--no_pad` to trim, or omit to pad silence; `--no_duration_match` disables time-stretching entirely |
 | CUDA out of memory | Use `--force_cpu`, or lower `QWEN3_LOCAL_MAX_CHARS_PER_CHUNK` / `TTS_MIN_FREE_VRAM_GB` in `.env` |
 | Interrupted a long run | Rerun with `--keep_temp --resume` to pick up from the last checkpoint |
